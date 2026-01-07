@@ -14,6 +14,7 @@ Date: 2026-01-07
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import numpy as np
@@ -30,32 +31,58 @@ class ClusterFeatureLoader:
     Each sample has a cluster ID per haploblock. These IDs are used as
     input to embedding layers that learn representations.
 
+    Supports two modes:
+    1. Discovery mode (default): Auto-detect cluster files, only load haploblocks with data
+    2. Boundaries mode: Load specific haploblocks from boundaries file
+
     Attributes:
         n_haploblocks: Number of haploblocks
         n_clusters_per_haploblock: List of cluster counts per haploblock
         sample_ids: List of sample IDs
     """
 
-    def __init__(self, pipeline_output_dir: Path):
+    def __init__(self, pipeline_output_dir: Path, auto_discover: bool = True):
         """
         Args:
             pipeline_output_dir: Directory containing pipeline outputs
                                 (clusters/, individual_hashes_*.tsv)
+            auto_discover: If True, automatically discover cluster files instead of
+                          requiring a boundaries file (default: True)
         """
         self.pipeline_output_dir = Path(pipeline_output_dir)
         self.clusters_dir = self.pipeline_output_dir / "clusters"
+        self.auto_discover = auto_discover
 
         self.n_haploblocks = 0
         self.n_clusters_per_haploblock: List[int] = []
         self.haploblock_boundaries: List[Tuple[int, int]] = []
         self.sample_ids: List[str] = []
 
-        logger.info(f"ClusterFeatureLoader initialized: {pipeline_output_dir}")
+        logger.info(f"ClusterFeatureLoader initialized: {pipeline_output_dir} (auto_discover={auto_discover})")
+
+    def _find_boundaries_file(self) -> Optional[Path]:
+        """Auto-find boundaries file with various naming patterns."""
+        patterns = [
+            "haploblock_boundaries.tsv",
+            "haploblock_boundaries_*.tsv",
+            "*_boundaries.tsv",
+        ]
+        for pattern in patterns:
+            matches = list(self.pipeline_output_dir.glob(pattern))
+            if matches:
+                # Prefer shorter names (more specific)
+                return sorted(matches, key=lambda p: len(p.name))[0]
+        return None
 
     def load_haploblock_boundaries(self, boundaries_file: Optional[Path] = None) -> List[Tuple[int, int]]:
         """Load haploblock boundaries from file."""
         if boundaries_file is None:
-            boundaries_file = self.pipeline_output_dir / "haploblock_boundaries.tsv"
+            boundaries_file = self._find_boundaries_file()
+            if boundaries_file is None:
+                raise FileNotFoundError(
+                    f"No boundaries file found in {self.pipeline_output_dir}. "
+                    "Expected haploblock_boundaries*.tsv"
+                )
 
         boundaries = []
         with open(boundaries_file, "r") as f:
@@ -68,84 +95,150 @@ class ClusterFeatureLoader:
 
         self.haploblock_boundaries = boundaries
         self.n_haploblocks = len(boundaries)
-        logger.info(f"Loaded {self.n_haploblocks} haploblock boundaries")
+        logger.info(f"Loaded {self.n_haploblocks} haploblock boundaries from {boundaries_file.name}")
         return boundaries
+
+    def discover_cluster_files(self) -> List[Tuple[Path, int, int]]:
+        """
+        Discover all cluster files in clusters/ directory.
+
+        Returns:
+            List of (file_path, start, end) tuples
+        """
+        if not self.clusters_dir.exists():
+            logger.warning(f"Clusters directory not found: {self.clusters_dir}")
+            return []
+
+        cluster_files = []
+        # Pattern: chr6_31480875-31603888_cluster.tsv or similar
+        pattern = re.compile(r"(?:chr\d+_)?(\d+)-(\d+)_cluster\.tsv$")
+
+        for f in self.clusters_dir.glob("*_cluster.tsv"):
+            match = pattern.search(f.name)
+            if match:
+                start, end = int(match.group(1)), int(match.group(2))
+                cluster_files.append((f, start, end))
+
+        # Sort by start position
+        cluster_files.sort(key=lambda x: x[1])
+        logger.info(f"Discovered {len(cluster_files)} cluster files")
+        return cluster_files
+
+    def _parse_cluster_file(self, cluster_file: Path) -> Tuple[Dict[str, int], int]:
+        """
+        Parse a single cluster file.
+
+        Returns:
+            sample_to_cluster: {sample_id: cluster_id}
+            n_clusters: Number of clusters
+        """
+        sample_to_cluster: Dict[str, int] = {}
+        rep_to_cluster: Dict[str, int] = {}
+        next_cluster = 0
+
+        with open(cluster_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) != 2:
+                    continue
+
+                rep, indiv = parts
+
+                # Assign cluster ID to representative
+                if rep not in rep_to_cluster:
+                    rep_to_cluster[rep] = next_cluster
+                    next_cluster += 1
+
+                # Map individual to cluster
+                # Extract sample name (e.g., "HG00096" from "HG00096_chr6_...")
+                sample_name = indiv.split("_")[0]
+                sample_to_cluster[sample_name] = rep_to_cluster[rep]
+
+        return sample_to_cluster, next_cluster
 
     def load_cluster_assignments(self) -> Tuple[Dict[str, Dict[str, int]], List[int]]:
         """
         Load cluster assignments for all haploblocks.
 
+        In auto_discover mode: only loads haploblocks that have cluster files.
+        In boundaries mode: loads all haploblocks from boundaries file.
+
         Returns:
             cluster_data: {haploblock_key: {sample_id: cluster_id}}
             n_clusters_per_haploblock: List of cluster counts
         """
-        if not self.haploblock_boundaries:
-            self.load_haploblock_boundaries()
-
         cluster_data: Dict[str, Dict[str, int]] = {}
         n_clusters_per_haploblock = []
         all_samples = set()
 
-        for start, end in self.haploblock_boundaries:
-            # Look for cluster file
-            cluster_file = None
-            for pattern in [
-                self.clusters_dir / f"chr*_{start}-{end}_cluster.tsv",
-                self.clusters_dir / f"*_{start}-{end}_cluster.tsv",
-                self.clusters_dir / f"{start}-{end}_cluster.tsv"
-            ]:
-                matches = list(self.clusters_dir.glob(pattern.name))
-                if matches:
-                    cluster_file = matches[0]
-                    break
+        if self.auto_discover:
+            # Discovery mode: find cluster files directly
+            cluster_files = self.discover_cluster_files()
 
-            if cluster_file is None:
-                logger.warning(f"No cluster file found for haploblock {start}-{end}")
-                cluster_data[f"{start}-{end}"] = {}
-                n_clusters_per_haploblock.append(1)  # Default 1 cluster
-                continue
+            if not cluster_files:
+                raise FileNotFoundError(
+                    f"No cluster files found in {self.clusters_dir}. "
+                    "Run the clustering pipeline (step 4) first."
+                )
 
-            # Parse cluster file: representative \t individual
-            sample_to_cluster: Dict[str, int] = {}
-            rep_to_cluster: Dict[str, int] = {}
-            next_cluster = 0
+            self.haploblock_boundaries = [(start, end) for _, start, end in cluster_files]
 
-            with open(cluster_file, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parts = line.split("\t")
-                    if len(parts) != 2:
-                        continue
+            for cluster_file, start, end in cluster_files:
+                sample_to_cluster, n_clusters = self._parse_cluster_file(cluster_file)
+                cluster_data[f"{start}-{end}"] = sample_to_cluster
+                n_clusters_per_haploblock.append(n_clusters + 1)  # +1 for padding
+                all_samples.update(sample_to_cluster.keys())
 
-                    rep, indiv = parts
+        else:
+            # Boundaries mode: load from boundaries file
+            if not self.haploblock_boundaries:
+                self.load_haploblock_boundaries()
 
-                    # Assign cluster ID to representative
-                    if rep not in rep_to_cluster:
-                        rep_to_cluster[rep] = next_cluster
-                        next_cluster += 1
+            n_found = 0
+            n_missing = 0
 
-                    # Map individual to cluster
-                    # Extract sample name (e.g., "HG00096" from "HG00096_chr6_...")
-                    sample_name = indiv.split("_")[0]
-                    sample_to_cluster[sample_name] = rep_to_cluster[rep]
-                    all_samples.add(sample_name)
+            for start, end in self.haploblock_boundaries:
+                # Look for cluster file
+                cluster_file = None
+                for pattern in [
+                    f"chr*_{start}-{end}_cluster.tsv",
+                    f"*_{start}-{end}_cluster.tsv",
+                    f"{start}-{end}_cluster.tsv"
+                ]:
+                    matches = list(self.clusters_dir.glob(pattern))
+                    if matches:
+                        cluster_file = matches[0]
+                        break
 
-            cluster_data[f"{start}-{end}"] = sample_to_cluster
-            n_clusters_per_haploblock.append(next_cluster + 1)  # +1 for padding
+                if cluster_file is None:
+                    n_missing += 1
+                    cluster_data[f"{start}-{end}"] = {}
+                    n_clusters_per_haploblock.append(1)  # Default 1 cluster
+                    continue
 
-            logger.debug(
-                f"Haploblock {start}-{end}: {len(sample_to_cluster)} samples, "
-                f"{next_cluster} clusters"
-            )
+                n_found += 1
+                sample_to_cluster, n_clusters = self._parse_cluster_file(cluster_file)
+                cluster_data[f"{start}-{end}"] = sample_to_cluster
+                n_clusters_per_haploblock.append(n_clusters + 1)  # +1 for padding
+                all_samples.update(sample_to_cluster.keys())
 
+            if n_missing > 0:
+                logger.warning(
+                    f"Cluster files: {n_found} found, {n_missing} missing "
+                    f"(use auto_discover=True to skip missing)"
+                )
+
+        self.n_haploblocks = len(self.haploblock_boundaries)
         self.n_clusters_per_haploblock = n_clusters_per_haploblock
         self.sample_ids = sorted(all_samples)
 
         logger.info(
-            f"Loaded clusters for {len(cluster_data)} haploblocks, "
-            f"{len(self.sample_ids)} samples"
+            f"Loaded {len(cluster_data)} haploblocks, "
+            f"{len(self.sample_ids)} samples, "
+            f"clusters per haploblock: {n_clusters_per_haploblock}"
         )
 
         return cluster_data, n_clusters_per_haploblock
@@ -378,7 +471,18 @@ if __name__ == "__main__":
 
     # Example usage
     print("ClusterFeatureLoader - loads cluster IDs for embedding")
-    print("Usage:")
+    print()
+    print("Usage (auto-discover mode - recommended):")
+    print("  loader = ClusterFeatureLoader('out_dir/TNFa')  # auto_discover=True by default")
+    print("  cluster_data, vocab_sizes = loader.load_cluster_assignments()")
+    print("  # Only loads haploblocks that have cluster files")
+    print()
+    print("Usage (boundaries mode):")
+    print("  loader = ClusterFeatureLoader('out_dir/TNFa', auto_discover=False)")
+    print("  cluster_data, vocab_sizes = loader.load_cluster_assignments()")
+    print("  # Loads all haploblocks from boundaries file, warns about missing clusters")
+    print()
+    print("Full training pipeline:")
     print("  loader = ClusterFeatureLoader('out_dir/TNFa')")
     print("  dataset = loader.prepare_dataset(['igsr-chb.tsv', 'igsr-gbr.tsv', 'igsr-pur.tsv'])")
     print("  X_train = dataset['X_train']  # (n_samples, n_haploblocks) cluster IDs")
