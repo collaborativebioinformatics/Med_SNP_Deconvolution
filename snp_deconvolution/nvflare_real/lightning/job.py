@@ -162,11 +162,12 @@ def parse_args():
         help='Immediately run the job in POC mode after creation'
     )
 
-    # Data configuration
+    # Data configuration - use relative path from project root
+    default_data_dir = str(project_root / 'data' / 'federated')
     parser.add_argument(
         '--data_dir',
         type=str,
-        default='/Users/saltfish/Files/Coding/Med_SNP_Deconvolution/snp_deconvolution/nvflare_real/data',
+        default=default_data_dir,
         help='Data directory (must contain site-specific data splits)'
     )
 
@@ -206,8 +207,10 @@ def create_job_with_recipe(
         FedJob instance
     """
     try:
-        from nvflare import FedJob
-        from nvflare.app_opt.pt.job_config.fed_avg import FedAvgJob
+        # NVFlare 2.7+ API
+        from nvflare.job_config.api import FedJob
+        from nvflare.app_common.workflows.fedavg import FedAvg
+        from nvflare.job_config.script_runner import ScriptRunner
     except ImportError:
         logger.error("NVFlare not installed. Install with: pip install nvflare")
         raise
@@ -222,13 +225,19 @@ def create_job_with_recipe(
     logger.info(f"Min Clients: {min_clients if min_clients else 'all'}")
     logger.info("="*60)
 
-    # Create FedAvg job
-    job = FedAvgJob(
+    # Create FedJob (NVFlare 2.7+ API)
+    job = FedJob(
         name=job_name,
-        num_rounds=num_rounds,
-        n_clients=len(clients),
         min_clients=min_clients if min_clients else len(clients),
     )
+
+    # Add FedAvg controller to server
+    controller = FedAvg(
+        num_clients=len(clients),
+        num_rounds=num_rounds,
+    )
+    job.to_server(controller)
+    logger.info("Added FedAvg controller to server")
 
     # Configure client script and arguments
     client_script = str(Path(__file__).parent / "client.py")
@@ -246,14 +255,14 @@ def create_job_with_recipe(
         f"--precision bf16-mixed"
     )
 
-    # Add client configuration to job
-    for client in clients:
-        job.to(
-            client,
-            client_script,
-            script_args=script_args,
-        )
-        logger.info(f"Configured client: {client}")
+    # Add ScriptRunner to all clients (don't specify individual clients)
+    # This allows simulator_run to use n_clients parameter
+    runner = ScriptRunner(
+        script=client_script,
+        script_args=script_args,
+    )
+    job.to_clients(runner)
+    logger.info(f"Configured ScriptRunner for clients")
 
     logger.info(f"Job created successfully: {job_name}")
     return job
@@ -269,12 +278,6 @@ def run_poc_mode(args):
     Args:
         args: Command line arguments
     """
-    try:
-        from nvflare.job import SimEnv
-    except ImportError:
-        logger.error("NVFlare not installed. Install with: pip install nvflare")
-        raise
-
     # Generate client names if not provided
     if args.clients:
         clients = [c.strip() for c in args.clients.split(',')]
@@ -307,12 +310,19 @@ def run_poc_mode(args):
     data_path = Path(args.data_dir)
     logger.info("\nVerifying client data...")
     for client in clients:
+        # Check both formats: site directory or combined file
+        client_dir = data_path / client
         client_data_file = data_path / f"{client}_{args.feature_type}.npz"
-        if client_data_file.exists():
+        train_file = client_dir / f"train_{args.feature_type}.npz"
+
+        if train_file.exists():
+            logger.info(f"  {client}: Data found at {client_dir}/")
+        elif client_data_file.exists():
             logger.info(f"  {client}: Data found at {client_data_file}")
         else:
-            logger.warning(f"  {client}: Data NOT found at {client_data_file}")
-            logger.warning(f"    Please ensure data is prepared before running!")
+            logger.warning(f"  {client}: Data NOT found!")
+            logger.warning(f"    Expected: {client_dir}/ or {client_data_file}")
+            logger.warning(f"    Please run prepare_federated_data.py first!")
 
     # Export job to workspace
     workspace_path = Path(args.workspace)
@@ -328,15 +338,17 @@ def run_poc_mode(args):
         logger.info("STARTING POC SIMULATION")
         logger.info("="*60)
 
-        # Create simulation environment
-        sim_env = SimEnv(workspace=str(workspace_path))
-
-        # Run the job
         logger.info(f"Running job: {args.job_name}")
         logger.info(f"Simulating {len(clients)} clients for {args.num_rounds} rounds...")
 
         try:
-            sim_env.run(job_name=args.job_name, clients=clients)
+            # NVFlare 2.7+ API: use job.simulator_run() directly
+            # When using to_clients() (generic), we must specify n_clients
+            job.simulator_run(
+                workspace=str(workspace_path),
+                n_clients=len(clients),
+                threads=len(clients),
+            )
             logger.info("\n" + "="*60)
             logger.info("POC SIMULATION COMPLETED SUCCESSFULLY")
             logger.info("="*60)

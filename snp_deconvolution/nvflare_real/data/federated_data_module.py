@@ -119,6 +119,39 @@ class SNPFederatedDataModule(pl.LightningDataModule):
         logger.info(f"  Feature type: {feature_type}")
         logger.info(f"  Data directory: {data_dir}")
 
+    def _normalize_site_name(self, site_name: str) -> str:
+        """
+        Normalize site name to match data directory naming convention.
+
+        NVFlare simulator creates clients with names like 'site-1', but
+        data directories may use 'site1' format. This method tries both.
+
+        Args:
+            site_name: Original site name from NVFlare
+
+        Returns:
+            Normalized site name that matches existing data directory
+        """
+        # Try original name first
+        if (self.data_dir / site_name).exists():
+            return site_name
+
+        # Try removing hyphens (site-1 -> site1)
+        normalized = site_name.replace('-', '')
+        if (self.data_dir / normalized).exists():
+            logger.info(f"Normalized site name: {site_name} -> {normalized}")
+            return normalized
+
+        # Try adding hyphens (site1 -> site-1)
+        import re
+        hyphenated = re.sub(r'(site)(\d+)', r'\1-\2', site_name)
+        if hyphenated != site_name and (self.data_dir / hyphenated).exists():
+            logger.info(f"Normalized site name: {site_name} -> {hyphenated}")
+            return hyphenated
+
+        # Return original if no match found
+        return site_name
+
     def _get_data_file_path(self) -> Path:
         """
         Get path to site-specific data file.
@@ -134,8 +167,11 @@ class SNPFederatedDataModule(pl.LightningDataModule):
         Raises:
             FileNotFoundError: If data file doesn't exist
         """
+        # Normalize site name to handle format differences (site-1 vs site1)
+        normalized_site_name = self._normalize_site_name(self.site_name)
+
         # Try layout 2: site subdirectory with train/val files (current format from data_splitter)
-        site_dir = self.data_dir / self.site_name
+        site_dir = self.data_dir / normalized_site_name
         train_file = site_dir / f"train_{self.feature_type}.npz"
         val_file = site_dir / f"val_{self.feature_type}.npz"
 
@@ -144,7 +180,7 @@ class SNPFederatedDataModule(pl.LightningDataModule):
             return site_dir  # Return directory, load split files in _load_npz_data
 
         # Try layout 1: site-specific combined file
-        data_file = self.data_dir / f"{self.site_name}_{self.feature_type}.npz"
+        data_file = self.data_dir / f"{normalized_site_name}_{self.feature_type}.npz"
         if data_file.exists():
             logger.info(f"Using combined data file: {data_file}")
             return data_file
@@ -156,13 +192,65 @@ class SNPFederatedDataModule(pl.LightningDataModule):
             return data_file
 
         raise FileNotFoundError(
-            f"Data file not found for site '{self.site_name}' with feature type '{self.feature_type}'\n"
+            f"Data file not found for site '{self.site_name}' (normalized: '{normalized_site_name}') "
+            f"with feature type '{self.feature_type}'\n"
             f"Tried:\n"
             f"  1. {site_dir}/train_{self.feature_type}.npz (split format)\n"
-            f"  2. {self.data_dir}/{self.site_name}_{self.feature_type}.npz (combined format)\n"
+            f"  2. {self.data_dir}/{normalized_site_name}_{self.feature_type}.npz (combined format)\n"
             f"  3. {self.data_dir}/{self.feature_type}.npz (shared format)\n"
             f"Please run prepare_federated_data.py to prepare the data."
         )
+
+    def _encode_cluster_ids(
+        self,
+        X: torch.Tensor,
+        encoding_dim: int = 8,
+    ) -> torch.Tensor:
+        """
+        Convert 2D cluster IDs to 3D encoded format for model input.
+
+        The model expects input shape (batch, n_features, encoding_dim).
+        If input is 2D (batch, n_features), we encode each cluster ID
+        using a simple Gaussian encoding.
+
+        Args:
+            X: Input tensor, shape (n_samples, n_features) or (n_samples, n_features, encoding_dim)
+            encoding_dim: Target encoding dimension (default 8)
+
+        Returns:
+            Encoded tensor with shape (n_samples, n_features, encoding_dim)
+        """
+        if X.dim() == 3:
+            # Already 3D, return as is
+            return X
+
+        if X.dim() != 2:
+            raise ValueError(f"Expected 2D or 3D tensor, got {X.dim()}D")
+
+        n_samples, n_features = X.shape
+
+        # Simple encoding: normalize cluster IDs and create encoding vectors
+        # Use Gaussian-like encoding where position in encoding_dim encodes the value
+        X_encoded = torch.zeros(n_samples, n_features, encoding_dim)
+
+        # Normalize cluster IDs to [0, 1] range
+        X_float = X.float()
+        X_min = X_float.min(dim=0, keepdim=True)[0]
+        X_max = X_float.max(dim=0, keepdim=True)[0]
+        X_range = X_max - X_min
+        X_range[X_range == 0] = 1  # Avoid division by zero
+        X_norm = (X_float - X_min) / X_range
+
+        # Create encoding: spread the normalized value across encoding_dim
+        # This creates a simple positional encoding based on the cluster ID
+        for i in range(encoding_dim):
+            # Create a Gaussian bump centered at position i/(encoding_dim-1)
+            center = i / (encoding_dim - 1) if encoding_dim > 1 else 0.5
+            sigma = 0.5 / encoding_dim  # Width of the Gaussian
+            X_encoded[:, :, i] = torch.exp(-((X_norm - center) ** 2) / (2 * sigma ** 2))
+
+        logger.info(f"Encoded 2D cluster IDs {X.shape} -> 3D {X_encoded.shape}")
+        return X_encoded
 
     def _load_npz_data(self, data_path: Path) -> Tuple[torch.Tensor, ...]:
         """
@@ -251,12 +339,13 @@ class SNPFederatedDataModule(pl.LightningDataModule):
                     y_test = y_val.clone()
                     logger.info("No test set found, using validation set as test set")
 
-        # Handle 2D data (add encoding dimension if needed)
+        # Handle 2D data (encode to 3D with proper encoding_dim)
         if X_train.dim() == 2:
-            logger.info("Data is 2D, adding encoding dimension (unsqueeze)")
-            X_train = X_train.unsqueeze(-1)
-            X_val = X_val.unsqueeze(-1)
-            X_test = X_test.unsqueeze(-1)
+            logger.info("Data is 2D, encoding cluster IDs to 3D format...")
+            encoding_dim = 8  # Standard encoding dimension for the model
+            X_train = self._encode_cluster_ids(X_train, encoding_dim)
+            X_val = self._encode_cluster_ids(X_val, encoding_dim)
+            X_test = self._encode_cluster_ids(X_test, encoding_dim)
 
         # Validate shapes
         if X_train.dim() != 3:

@@ -62,11 +62,12 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    # Data arguments
+    # Data arguments - use relative path from project root as default
+    default_data_dir = str(project_root / 'data' / 'federated')
     parser.add_argument(
         '--data_dir',
         type=str,
-        default='/Users/saltfish/Files/Coding/Med_SNP_Deconvolution/snp_deconvolution/nvflare_real/data',
+        default=default_data_dir,
         help='Directory containing federated data splits'
     )
     parser.add_argument(
@@ -235,6 +236,7 @@ def run_federated_client(args):
     """
     try:
         import nvflare.client as flare
+        from nvflare.app_common.abstract.fl_model import ParamsType
     except ImportError:
         logger.error("NVFlare not installed. Install with: pip install nvflare")
         raise RuntimeError("NVFlare package is required for federated training")
@@ -282,25 +284,7 @@ def run_federated_client(args):
         focal_gamma=args.focal_gamma,
     )
 
-    # Step 5: Create Lightning trainer
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=Path(args.checkpoint_dir) / site_name,
-        filename='snp-{epoch:02d}-{val_loss:.4f}',
-        monitor='val_loss',
-        mode='min',
-        save_top_k=args.save_top_k,
-        save_last=True,
-        verbose=True,
-    )
-
-    early_stopping = EarlyStopping(
-        monitor='val_loss',
-        patience=5,
-        mode='min',
-        verbose=True,
-    )
-
-    # Determine accelerator
+    # Step 5: Configure accelerator
     if torch.cuda.is_available():
         accelerator = 'gpu'
         devices = 1
@@ -310,54 +294,85 @@ def run_federated_client(args):
         devices = 'auto'
         logger.info("Using CPU")
 
-    trainer = pl.Trainer(
-        max_epochs=args.local_epochs,
-        precision=args.precision,
-        accelerator=accelerator,
-        devices=devices,
-        callbacks=[checkpoint_callback, early_stopping],
-        enable_progress_bar=True,
-        log_every_n_steps=10,
-        enable_model_summary=True,
-    )
-
-    # Step 6: CRITICAL - Patch trainer with NVFlare
-    # This enables federated learning by intercepting model updates
-    logger.info("Patching Lightning trainer with NVFlare...")
-    flare.patch(trainer)
-    logger.info("Trainer patched successfully - federated learning enabled")
-
-    # Step 7: Federated learning loop
+    # Step 6: Federated learning loop (using standard NVFlare Client API)
+    # Reference: https://nvflare.readthedocs.io/en/main/programming_guide/execution_api_type/client_api
     logger.info("Starting federated learning loop...")
     round_num = 0
+    total_steps = 0
 
     while flare.is_running():
         # Receive global model from server
         input_model = flare.receive()
-        round_num = input_model.current_round
+        round_num = input_model.current_round if hasattr(input_model, 'current_round') else round_num
         logger.info(f"\n{'='*60}")
         logger.info(f"FL Round {round_num}: Received global model from server")
         logger.info(f"{'='*60}")
 
-        # Optional: Validate with current global model before training
-        logger.info(f"Round {round_num}: Validating global model...")
-        val_results = trainer.validate(model, datamodule=data_module)
-        if val_results:
-            logger.info(f"Round {round_num}: Global model val_loss={val_results[0].get('val_loss', 'N/A'):.4f}")
+        # CRITICAL: Load global model weights into local model
+        if input_model.params is not None and len(input_model.params) > 0:
+            logger.info(f"Round {round_num}: Loading global model weights ({len(input_model.params)} parameters)...")
+            try:
+                model.load_state_dict(input_model.params)
+                logger.info(f"Round {round_num}: Global model weights loaded successfully")
+            except RuntimeError as e:
+                logger.error(f"Round {round_num}: Error loading state_dict: {e}")
+                if round_num == 0:
+                    logger.warning(f"Round {round_num}: Ignoring load error for initial round, using local initialization.")
+                else:
+                    raise e
+        else:
+            logger.info(f"Round {round_num}: No global weights received (or empty params), using initial/local weights")
+
+        # Create Trainer for THIS round
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=Path(args.checkpoint_dir) / site_name,
+            filename=f'snp-round{round_num}-{{epoch:02d}}-{{val_loss:.4f}}',
+            monitor='val_loss',
+            mode='min',
+            save_top_k=args.save_top_k,
+            save_last=True,
+            verbose=True,
+        )
+
+        early_stopping = EarlyStopping(
+            monitor='val_loss',
+            patience=5,
+            mode='min',
+            verbose=True,
+        )
+
+        trainer = pl.Trainer(
+            max_epochs=args.local_epochs,
+            precision=args.precision,
+            accelerator=accelerator,
+            devices=devices,
+            callbacks=[checkpoint_callback, early_stopping],
+            enable_progress_bar=True,
+            log_every_n_steps=10,
+            enable_model_summary=True,
+        )
 
         # Local training
         logger.info(f"Round {round_num}: Starting local training ({args.local_epochs} epochs)...")
         trainer.fit(model, datamodule=data_module)
         logger.info(f"Round {round_num}: Local training completed")
 
-        # Optional: Test with updated model
-        logger.info(f"Round {round_num}: Testing updated model...")
-        test_results = trainer.test(model, datamodule=data_module, ckpt_path="best")
-        if test_results:
-            logger.info(f"Round {round_num}: Test acc={test_results[0].get('test_acc', 'N/A'):.4f}")
+        # Calculate steps for this round
+        steps_this_round = args.local_epochs * len(data_module.train_dataloader())
+        total_steps += steps_this_round
 
-        # Model updates are automatically sent back to server via flare.patch()
+        # Create output FLModel with updated weights
+        # Reference: https://nvflare.readthedocs.io/en/main/release_notes/flare_240
+        output_model = flare.FLModel(
+            params=model.cpu().state_dict(),
+            params_type=ParamsType.FULL,
+            metrics={"NUM_STEPS_CURRENT_ROUND": steps_this_round},
+        )
+
+        # Send model back to server
         logger.info(f"Round {round_num}: Sending model updates to server...")
+        flare.send(output_model)
+        logger.info(f"Round {round_num}: Model updates sent successfully")
 
     logger.info(f"\n{'='*60}")
     logger.info(f"Federated learning completed after {round_num} rounds")
@@ -387,3 +402,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
