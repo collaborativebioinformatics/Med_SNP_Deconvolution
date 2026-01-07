@@ -1,0 +1,11 @@
+# Core dependencies for NVFlare base module
+numpy>=1.24.0
+torch>=2.0.0
+xgboost>=2.0.0
+
+# Optional: NVFlare integration (Phase 2)
+# nvflare>=2.4.0
+
+# Development dependencies
+pytest>=7.0.0
+pytest-cov>=4.0.0

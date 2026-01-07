@@ -1,0 +1,202 @@
+# SNP Deconvolution Configuration
+# ================================
+# Phase 1: Non-federated GPU training
+# GPU: A100/H100 (40GB+), CUDA 12.x, bf16
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+data:
+  # Haploblock pipeline output directory
+  pipeline_output_dir: "out_dir/TNFa"
+
+  # VCF file path (1000 Genomes Phase 3)
+  vcf_path: "data/ALL.chr6.shapeit2_integrated_snvindels_v2a_27022019.GRCh38.phased.vcf.gz"
+
+  # Reference genome
+  reference_path: "data/Homo_sapiens.GRCh38.dna.chromosome.6.fa.bgz"
+
+  # Population files for labels (1000 Genomes)
+  population_files:
+    - "data/igsr-chb.tsv.tsv"  # CHB - Han Chinese (label: 0)
+    - "data/igsr-gbr.tsv.tsv"  # GBR - British (label: 1)
+    - "data/igsr-pur.tsv.tsv"  # PUR - Puerto Rican (label: 2)
+
+  # Feature configuration
+  features:
+    include_haploblock_features: true
+    include_cluster_features: true
+    include_hash_features: true
+
+  # Filtering
+  filtering:
+    min_maf: 0.01           # Minimum minor allele frequency
+    max_missing_rate: 0.1   # Maximum missing rate per SNP
+
+  # Train/val/test split
+  split:
+    train: 0.7
+    val: 0.15
+    test: 0.15
+    random_seed: 42
+
+# =============================================================================
+# GPU Configuration (A100/H100 optimized)
+# =============================================================================
+gpu:
+  enabled: true
+  device_ids: [0]           # Use [0, 1] for multi-GPU
+  memory_fraction: 0.9      # Reserve 10% for system
+
+  # A100/H100 specific
+  use_bf16: true            # bfloat16 (native support)
+  use_tf32: true            # TensorFloat-32 for matmul
+  cudnn_benchmark: true     # Enable cuDNN auto-tuner
+
+# =============================================================================
+# XGBoost Configuration
+# =============================================================================
+xgboost:
+  enabled: true
+
+  # Model parameters
+  n_estimators: 2000        # More trees for better performance
+  max_depth: 6
+  learning_rate: 0.1
+
+  # GPU parameters (A100/H100 optimized)
+  tree_method: "gpu_hist"
+  gpu_id: 0
+  predictor: "gpu_predictor"
+  max_bin: 512              # Higher precision on large GPU
+
+  # Regularization
+  reg_alpha: 0.1            # L1 regularization
+  reg_lambda: 1.0           # L2 regularization
+  min_child_weight: 5       # Prevent overfitting to rare variants
+
+  # Sampling
+  subsample: 0.8
+  colsample_bytree: 0.5     # Sample SNPs per tree
+  colsample_bylevel: 0.8
+
+  # Training
+  early_stopping_rounds: 50
+  eval_metric: "mlogloss"   # Multi-class log loss
+
+  # Feature selection
+  feature_selection:
+    enabled: true
+    initial_k: 10000        # Start with top 10K SNPs
+    reduction_factor: 0.5   # Reduce by 50% each iteration
+    min_snps: 100           # Stop at 100 SNPs minimum
+    max_iterations: 5
+    importance_type: "gain"
+
+# =============================================================================
+# Deep Learning Configuration (PyTorch Lightning)
+# =============================================================================
+deep_learning:
+  enabled: true
+
+  # Model architecture
+  architecture: "cnn_transformer"  # Options: cnn, cnn_transformer
+
+  model:
+    encoding_dim: 8           # 8-dimensional haplotype encoding
+    cnn_channels: [32, 64]    # CNN feature channels
+    kernel_size: 5
+    transformer_dim: 128      # Transformer hidden dimension
+    num_transformer_layers: 4
+    num_heads: 8
+    dropout: 0.2
+
+  # PyTorch Lightning handles precision automatically
+  # Use precision="bf16-mixed" for A100/H100
+  lightning:
+    precision: "bf16-mixed"   # Lightning handles bf16 automatically
+    accelerator: "gpu"
+    devices: 1                # Use 2+ for multi-GPU
+
+  # Training
+  training:
+    batch_size: 128           # Large batch for A100
+    learning_rate: 0.0001
+    weight_decay: 0.00001
+    epochs: 100
+    early_stopping_patience: 15
+    gradient_clip_val: 1.0
+
+  # Loss function
+  loss:
+    type: "focal"             # Focal loss for class imbalance
+    focal_alpha: 0.25
+    focal_gamma: 2.0
+
+  # Learning rate scheduler
+  scheduler:
+    type: "cosine"            # cosine, plateau, or none
+    warmup_epochs: 5
+
+# =============================================================================
+# NVFlare Preparation (Phase 2)
+# =============================================================================
+nvflare:
+  # Federation strategy
+  aggregation_strategy: "fedavg"  # Options: fedavg, fedprox
+
+  # FedProx parameters (if using fedprox)
+  fedprox:
+    mu: 0.1                   # Proximal term weight
+
+  # Communication
+  num_rounds: 50              # Federated rounds
+  local_epochs: 1             # Local epochs per round
+  min_clients: 2              # Minimum clients for aggregation
+
+  # Privacy (optional)
+  differential_privacy:
+    enabled: false
+    epsilon: 1.0
+    delta: 0.00001
+    max_grad_norm: 1.0
+
+# =============================================================================
+# Output Configuration
+# =============================================================================
+output:
+  dir: "results/snp_deconvolution"
+
+  # What to save
+  save_model_checkpoints: true
+  save_feature_importance: true
+  save_training_curves: true
+  save_predictions: true
+
+  # Comparison
+  compare_methods: true       # Compare XGBoost vs DL results
+
+  # Logging
+  log_level: "INFO"
+  tensorboard: true
+
+# =============================================================================
+# Evaluation Configuration
+# =============================================================================
+evaluation:
+  metrics:
+    - accuracy
+    - precision
+    - recall
+    - f1
+    - auc_roc
+    - confusion_matrix
+
+  # SNP importance analysis
+  importance:
+    top_k: 100                # Report top 100 SNPs
+    methods:
+      - xgboost_gain
+      - attention_weights
+      - integrated_gradients
+    compare_overlap: true     # Compare SNP rankings between methods
