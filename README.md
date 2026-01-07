@@ -11,31 +11,38 @@ This project provides an end-to-end pipeline for:
 3. **Federated Learning** - NVFlare integration for multi-site privacy-preserving training
 
 ```mermaid
-graph LR
-    subgraph Phase1 ["Phase 1: Haploblock Pipeline"]
-        VCF["Phased VCF<br/>(1000 Genomes)"] --> HB["Haploblock<br/>Boundaries"]
-        HB --> SEQ["Phased<br/>Sequences"]
-        SEQ --> CLU["MMSeqs2<br/>Clustering"]
-        CLU --> HASH["Genomic<br/>Hashes"]
+graph TD
+
+    subgraph Data_Pipeline [Data & Feature Layer]
+        RAW[Biobank VCF / HB Hashes] --> DP[Data Preprocessing]
+        DP --> FS[Feature Set: Sparse Matrix/Tensors]
     end
 
-    subgraph Phase2 ["Phase 2: SNP Deconvolution"]
-        HASH --> |"Cluster IDs"| DL["Deep Learning<br/>(Embedding + Transformer)"]
-        VCF --> |"Genotypes"| XGB["XGBoost GPU<br/>(Sparse Matrix)"]
-        DL --> POP["Population<br/>Classification"]
-        XGB --> POP
+    subgraph Model_Abstraction [Unified Model Abstraction Layer]
+        FS --> M_INT{{"BaseSNPModel (Interface)"}}
+
+        subgraph Implementations [Internal Implementations]
+            M_INT --> XGB[XGBoost Strategy]
+            M_INT --> ADL[Attention DL Strategy]
+        end
+        
+        XGB & ADL --> M_OUT["Unified Output: Logits / Feature Importance"]
     end
 
-    subgraph Phase3 ["Phase 3: Federated Learning"]
-        POP --> FED["NVFlare<br/>FedAvg/FedProx"]
-        FED --> SITE1["Site 1"]
-        FED --> SITE2["Site 2"]
-        FED --> SITE3["Site N"]
+    subgraph Federated_Layer [NVFlare Federated Infrastructure]
+        M_INT -.-> |Strategy Injection| EXEC[SNPDeconvExecutor]
+        EXEC --> |Comm| SERVER[NVFlare Aggregator]
+        SERVER --> |Global Update| EXEC
     end
 
-    style Phase1 fill:#e8f5e9,stroke:#2e7d32
-    style Phase2 fill:#e3f2fd,stroke:#1565c0
-    style Phase3 fill:#fff3e0,stroke:#ef6c00
+    subgraph Evaluation [Evaluation Framework]
+        M_OUT --> Metrics[AUC / PRC / SNP Ranking]
+        Metrics --> Val[Biological Validation via ClinVar]
+    end
+
+    style M_INT fill:#f96,stroke:#333,stroke-width:4px
+    style Federated_Layer fill:#e1f5fe,stroke:#01579b
+    style Implementations fill:#fff3e0,stroke:#ff6f00,stroke-dasharray: 5 5
 ```
 
 ## Project Structure
