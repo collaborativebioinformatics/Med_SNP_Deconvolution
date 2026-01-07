@@ -3,6 +3,10 @@ XGBoost NVFlare Executor for SNP Deconvolution
 
 Wraps XGBoost SNP trainer for horizontal federated learning with NVFlare.
 
+Supports two feature modes:
+- Cluster mode (default): Privacy-preserving Cluster ID features from Haploblock pipeline
+- SNP mode: Direct sparse SNP matrix (0/1/2 dosage) for baseline comparison
+
 Federated XGBoost Strategies:
     1. Tree Ensemble: Each site trains, server ensembles models
     2. Histogram Aggregation: Aggregate gradient histograms (requires NVFlare XGBoost plugin)
@@ -69,9 +73,10 @@ class XGBoostNVFlareExecutor(SNPDeconvExecutor):
         self,
         trainer: Any,  # XGBoostSNPTrainer
         data_loader: Any = None,
-        num_snps: Optional[int] = None,
+        num_features: Optional[int] = None,
         num_populations: Optional[int] = None,
         xgb_params: Optional[Dict[str, Any]] = None,
+        use_cluster_features: bool = True,
     ):
         """
         Initialize XGBoost NVFlare executor.
@@ -79,9 +84,11 @@ class XGBoostNVFlareExecutor(SNPDeconvExecutor):
         Args:
             trainer: XGBoostSNPTrainer instance or None
             data_loader: Data loader for local training data
-            num_snps: Number of SNP features (inferred if not provided)
+            num_features: Number of features (haploblocks or SNPs, inferred if not provided)
             num_populations: Number of populations (inferred if not provided)
             xgb_params: XGBoost parameters override
+            use_cluster_features: If True (default), use Cluster ID features for
+                privacy-preserving training. If False, use raw SNP features.
 
         Raises:
             ImportError: If XGBoost not installed
@@ -97,20 +104,23 @@ class XGBoostNVFlareExecutor(SNPDeconvExecutor):
         self.trainer = trainer
         self.data_loader = data_loader
         self.model: Optional[xgb.Booster] = None
+        self.use_cluster_features = use_cluster_features
 
         # Infer dimensions from trainer if available
         if trainer is not None:
-            self._num_snps = getattr(trainer, 'num_snps', num_snps)
-            self._num_populations = getattr(trainer, 'num_populations', num_populations)
+            self._num_features = getattr(trainer, 'n_features_in_', num_features)
+            self._num_populations = getattr(trainer, 'num_class', num_populations)
+            # Inherit use_cluster_features from trainer if available
+            self.use_cluster_features = getattr(trainer, 'use_cluster_features', use_cluster_features)
         else:
-            if num_snps is None or num_populations is None:
+            if num_features is None or num_populations is None:
                 raise ValueError(
-                    "Must provide num_snps and num_populations when trainer is None"
+                    "Must provide num_features and num_populations when trainer is None"
                 )
-            self._num_snps = num_snps
+            self._num_features = num_features
             self._num_populations = num_populations
 
-        # Default XGBoost parameters optimized for SNP data
+        # Default XGBoost parameters optimized for genomic data
         self.xgb_params = xgb_params or {
             'objective': 'multi:softprob',
             'num_class': self._num_populations,
@@ -128,9 +138,10 @@ class XGBoostNVFlareExecutor(SNPDeconvExecutor):
         self._dval: Optional[DMatrix] = None
         self._feature_names: Optional[List[str]] = None
 
+        feature_type = "Haploblocks (Cluster)" if use_cluster_features else "SNPs"
         logger.info(
             f"Initialized XGBoostNVFlareExecutor: "
-            f"{self._num_snps} SNPs, {self._num_populations} populations"
+            f"{self._num_features} {feature_type}, {self._num_populations} populations"
         )
 
     @property
@@ -139,9 +150,9 @@ class XGBoostNVFlareExecutor(SNPDeconvExecutor):
         return 'xgboost'
 
     @property
-    def num_snps(self) -> int:
-        """Return number of SNP features"""
-        return self._num_snps
+    def num_features(self) -> int:
+        """Return number of features (haploblocks or SNPs)"""
+        return self._num_features
 
     @property
     def num_populations(self) -> int:
@@ -152,28 +163,48 @@ class XGBoostNVFlareExecutor(SNPDeconvExecutor):
         """
         Prepare XGBoost DMatrix from data.
 
+        Supports two input modes:
+        - Cluster mode: X is a dense matrix of Cluster IDs (n_samples, n_haploblocks)
+        - SNP mode: X is a sparse or dense matrix of SNP genotypes (n_samples, n_snps)
+
         Args:
-            X: SNP genotype matrix (n_samples, n_snps)
+            X: Feature matrix
+                - Cluster mode: Cluster ID matrix (int values)
+                - SNP mode: SNP genotype matrix (0/1/2 values)
             y: Population labels (n_samples,)
             is_validation: Whether this is validation data
         """
-        # Create feature names
+        # Create feature names based on mode
         if self._feature_names is None:
-            self._feature_names = [f"SNP_{i}" for i in range(X.shape[1])]
+            if self.use_cluster_features:
+                self._feature_names = [f"HB_{i}" for i in range(X.shape[1])]
+            else:
+                self._feature_names = [f"SNP_{i}" for i in range(X.shape[1])]
 
-        dmatrix = xgb.DMatrix(
-            X,
-            label=y,
-            feature_names=self._feature_names,
-            enable_categorical=False,
-        )
+        # Handle cluster mode
+        if self.use_cluster_features:
+            X = np.asarray(X, dtype=np.int32)
+            dmatrix = xgb.DMatrix(
+                X,
+                label=y,
+                feature_names=self._feature_names,
+                enable_categorical=True,
+            )
+        else:
+            dmatrix = xgb.DMatrix(
+                X,
+                label=y,
+                feature_names=self._feature_names,
+                enable_categorical=False,
+            )
 
+        mode_str = "Cluster" if self.use_cluster_features else "SNP"
         if is_validation:
             self._dval = dmatrix
-            logger.info(f"Prepared validation data: {X.shape[0]} samples")
+            logger.info(f"Prepared validation data ({mode_str} mode): {X.shape[0]} samples")
         else:
             self._dtrain = dmatrix
-            logger.info(f"Prepared training data: {X.shape[0]} samples")
+            logger.info(f"Prepared training data ({mode_str} mode): {X.shape[0]} samples")
 
     def get_model_weights(self) -> Dict[str, Any]:
         """
@@ -197,11 +228,12 @@ class XGBoostNVFlareExecutor(SNPDeconvExecutor):
         try:
             serialized = serialize_xgboost_model(self.model, include_metadata=True)
 
-            # Add SNP-specific metadata
+            # Add feature metadata
             serialized.update({
-                'num_snps': self._num_snps,
+                'num_features': self._num_features,
                 'num_populations': self._num_populations,
                 'model_type': 'xgboost',
+                'use_cluster_features': self.use_cluster_features,
                 'xgb_params': self.xgb_params,
                 'round': self._round,
             })
@@ -233,7 +265,7 @@ class XGBoostNVFlareExecutor(SNPDeconvExecutor):
         if not validate_model_weights(
             weights,
             expected_model_type='xgboost',
-            expected_num_snps=self._num_snps,
+            expected_num_features=self._num_features,
         ):
             raise ValueError("Model weight validation failed")
 
@@ -399,16 +431,24 @@ class XGBoostNVFlareExecutor(SNPDeconvExecutor):
 
     def get_feature_importance(self) -> Dict[int, float]:
         """
-        Get SNP importance scores from local model.
+        Get feature importance scores from local model.
+
+        In Cluster mode, returns Haploblock importance scores.
+        In SNP mode, returns SNP importance scores.
 
         Returns:
-            Dictionary mapping SNP index to normalized importance score
+            Dictionary mapping feature index to normalized importance score
+            - Cluster mode: Haploblock index → importance
+            - SNP mode: SNP index → importance
 
         Raises:
             RuntimeError: If model not trained
         """
         if self.model is None:
             raise RuntimeError("Model not trained")
+
+        feature_prefix = "HB_" if self.use_cluster_features else "SNP_"
+        feature_type = "Haploblock" if self.use_cluster_features else "SNP"
 
         try:
             # Get gain-based importance
@@ -417,8 +457,8 @@ class XGBoostNVFlareExecutor(SNPDeconvExecutor):
             # Convert feature names to indices
             importance_by_index = {}
             for feature_name, score in importance_dict.items():
-                # Extract index from "SNP_123" format
-                if feature_name.startswith('SNP_'):
+                # Extract index from "HB_123" or "SNP_123" format
+                if feature_name.startswith(feature_prefix):
                     idx = int(feature_name.split('_')[1])
                     importance_by_index[idx] = score
                 else:
@@ -438,7 +478,7 @@ class XGBoostNVFlareExecutor(SNPDeconvExecutor):
                 }
 
             logger.info(
-                f"Computed feature importance for {len(importance_by_index)} SNPs"
+                f"Computed feature importance for {len(importance_by_index)} {feature_type}s"
             )
 
             return importance_by_index
@@ -467,9 +507,10 @@ class XGBoostNVFlareExecutor(SNPDeconvExecutor):
         return {
             'status': 'trained',
             'num_trees': self.get_tree_ensemble_size(),
-            'num_features': self.model.num_features(),
-            'num_snps': self._num_snps,
+            'num_features': self._num_features,
             'num_populations': self._num_populations,
+            'use_cluster_features': self.use_cluster_features,
+            'feature_type': 'Haploblock' if self.use_cluster_features else 'SNP',
             'parameters': self.xgb_params,
             'round': self._round,
         }
@@ -477,10 +518,12 @@ class XGBoostNVFlareExecutor(SNPDeconvExecutor):
     def __repr__(self) -> str:
         """String representation"""
         trees = self.get_tree_ensemble_size()
+        mode = "cluster" if self.use_cluster_features else "snp"
         return (
             f"XGBoostNVFlareExecutor("
-            f"snps={self._num_snps}, "
+            f"features={self._num_features}, "
             f"populations={self._num_populations}, "
+            f"mode={mode}, "
             f"trees={trees}, "
             f"round={self._round})"
         )

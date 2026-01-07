@@ -98,44 +98,52 @@ individual_hash = strand(4) + chromosome(10) + haploblock(20) + cluster(20) + [v
 
 **Key Insight**: The **Cluster ID** is the meaningful categorical feature for ML/DL!
 
-## Architecture: Two ML Approaches
+## Architecture: Unified Privacy-Preserving ML
+
+Both models now support the **privacy-preserving Cluster ID mode** (recommended):
 
 ```mermaid
 graph TD
-    subgraph Input ["Input Data"]
+    subgraph Input ["Unified Input (Privacy-Preserving)"]
         PIPE["Pipeline Output<br/>(clusters/*.tsv)"]
-        VCF2["VCF Genotypes"]
+    end
+
+    subgraph Feature ["Feature Extraction"]
+        PIPE --> CID["Cluster ID Matrix<br/>(samples × haploblocks)"]
     end
 
     subgraph Models ["Models"]
-        XGB["XGBoost Model"]
-        EMB["Embedding Layer<br/>"]
-        DL["Deep Learning Model"]
+        CID --> XGB["XGBoost<br/>(Categorical Features)"]
+        CID --> EMB["Embedding Layer"]
+        EMB --> DL["Deep Learning<br/>(Transformer)"]
     end
 
-    VCF2 --> XGB
-    PIPE --> EMB
-    EMB --> DL
-    
     XGB --> OUT["Population<br/>Classification"]
     DL --> OUT
 
-    style EMB fill:#ff9800,stroke:#ef6c00,stroke-width:2px
+    style CID fill:#ff9800,stroke:#ef6c00,stroke-width:2px
     style XGB fill:#4caf50,stroke:#2e7d32,stroke-width:2px,color:#fff
     style DL fill:#2196f3,stroke:#1565c0,stroke-width:2px,color:#fff
 ```
 
-### Comparison
+### Feature Modes
+
+| Mode | Privacy | Input | Use Case |
+|------|---------|-------|----------|
+| **Cluster (default)** | High | Cluster ID matrix | Privacy-preserving federated learning |
+| **SNP (baseline)** | Low | Sparse SNP matrix | Baseline comparison |
+
+### Model Comparison
 
 | Aspect | XGBoost GPU | Deep Learning |
 |--------|-------------|---------------|
-| **Input** | Sparse SNP matrix (0/1/2) | Cluster ID matrix (int) |
-| **Features** | Manual encoding | Learned embeddings |
+| **Input** | Cluster ID (categorical) | Cluster ID → Embedding |
+| **Features** | XGBoost auto-splits | Learned representations |
 | **Model** | Gradient boosted trees | CNN + Transformer |
-| **Interpretability** | gain/weight scores | Attention weights |
+| **Interpretability** | Haploblock importance | Attention weights |
 | **Speed** | Fast | Slower |
 | **Long-range patterns** | Limited | Captures via Transformer |
-| **Best for** | Baseline, feature selection | Complex interactions |
+| **Best for** | Quick baseline | Complex interactions |
 <!-- 
 ## Quick Start
 
