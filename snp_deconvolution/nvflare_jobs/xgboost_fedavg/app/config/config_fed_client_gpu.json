@@ -1,0 +1,51 @@
+{
+  "format_version": 2,
+  "executors": [
+    {
+      "tasks": ["*"],
+      "executor": {
+        "path": "nvflare.app_opt.xgboost.histogram_based_v2.fed_executor.FedXGBHistogramExecutor",
+        "args": {
+          "data_loader_id": "snp_data_loader",
+          "early_stopping_rounds": 10,
+          "verbose_eval": true,
+          "use_gpus": true,
+          "metrics_writer_id": "metrics_writer"
+        }
+      }
+    }
+  ],
+  "task_result_filters": [],
+  "task_data_filters": [],
+  "components": [
+    {
+      "id": "snp_data_loader",
+      "path": "snp_deconvolution.nvflare_real.xgboost.data_loader.SNPXGBDataLoader",
+      "args": {
+        "data_dir": "{DATASET_PATH}",
+        "site_name": "{SITE_NAME}",
+        "use_cluster_features": true,
+        "validation_split": 0.2,
+        "random_seed": 42,
+        "feature_prefix": "snp_",
+        "label_column": "label",
+        "enable_categorical": false
+      }
+    },
+    {
+      "id": "metrics_writer",
+      "path": "nvflare.app_common.widgets.streaming.AnalyticsSender",
+      "args": {
+        "event_type": "fed.analytix_log_stats"
+      }
+    },
+    {
+      "id": "event_to_fed",
+      "path": "nvflare.app_common.widgets.convert_to_fed_event.ConvertToFedEvent",
+      "args": {
+        "events_to_convert": ["analytix_log_stats"],
+        "fed_event_prefix": "fed."
+      }
+    }
+  ]
+}

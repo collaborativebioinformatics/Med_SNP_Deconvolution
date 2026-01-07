@@ -1,0 +1,67 @@
+{
+  "format_version": 2,
+  "min_clients": 2,
+  "num_rounds": 100,
+  "server": {
+    "heart_beat_timeout": 600
+  },
+  "task_data_filters": [],
+  "task_result_filters": [],
+  "components": [
+    {
+      "id": "xgb_controller",
+      "path": "nvflare.app_opt.xgboost.histogram_based_v2.fed_controller.XGBFedController",
+      "args": {
+        "num_rounds": "{num_rounds}",
+        "data_split_mode": 0,
+        "secure_training": false,
+        "xgb_params": {
+          "objective": "multi:softprob",
+          "num_class": 3,
+          "eta": 0.1,
+          "max_depth": 6,
+          "min_child_weight": 1,
+          "subsample": 0.8,
+          "colsample_bytree": 0.8,
+          "gamma": 0,
+          "lambda": 1,
+          "alpha": 0,
+          "tree_method": "hist",
+          "eval_metric": "mlogloss",
+          "seed": 42,
+          "nthread": -1,
+          "verbosity": 1
+        },
+        "xgb_options": {
+          "early_stopping_rounds": 10,
+          "verbose_eval": true
+        }
+      }
+    },
+    {
+      "id": "persistor",
+      "path": "nvflare.app_opt.xgboost.histogram_based_v2.model_persistor.XGBModelPersistor",
+      "args": {
+        "save_name": "model.json"
+      }
+    },
+    {
+      "id": "metric_logger",
+      "path": "nvflare.app_common.widgets.streaming.AnalyticsReceiver",
+      "args": {
+        "events": ["fed.analytix_log_stats"]
+      }
+    }
+  ],
+  "workflows": [
+    {
+      "id": "xgb_workflow",
+      "path": "nvflare.app_opt.xgboost.histogram_based_v2.fed_controller.XGBFedController",
+      "args": {
+        "num_rounds": "{num_rounds}",
+        "data_split_mode": 0,
+        "secure_training": false
+      }
+    }
+  ]
+}

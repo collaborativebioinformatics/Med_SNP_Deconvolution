@@ -1,0 +1,11 @@
+{
+  "name": "xgboost_fedavg_snp",
+  "description": "Federated XGBoost training for SNP-based population deconvolution using histogram-based aggregation",
+  "version": "1.0.0",
+  "resource_spec": {},
+  "deploy_map": {
+    "app": ["@ALL"]
+  },
+  "min_clients": 2,
+  "mandatory_clients": []
+}
