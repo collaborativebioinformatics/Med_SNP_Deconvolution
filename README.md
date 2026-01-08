@@ -182,6 +182,8 @@ python main.py --config config/default.yaml # This may not work follow the origi
 ```shell
 cd ~/Med_SNP_Deconvolution/snp_deconvolution/nvflare_jobs/xgboost_fedavg
 ```
+
+```
 Create config file
  my_job/
   ├── meta.json
@@ -189,9 +191,9 @@ Create config file
       └── config/
           ├── config_fed_server.json
           └── config_fed_client.json
-
+```
 1. meta.json
-
+```json
   {
       "name": "xgboost_fedavg_snp",
       "resource_spec": {},
@@ -200,9 +202,9 @@ Create config file
       },
       "min_clients": 3
   }
-
+```
 2. config_fed_server.json
-
+```json
   {
       "format_version": 2,
       "num_rounds": 10,
@@ -228,9 +230,9 @@ Create config file
           }
       ]
   }
-
+```
 3. config_fed_client.json
-
+```json
   {
       "format_version": 2,
       "executors": [
@@ -258,10 +260,11 @@ Create config file
           }
       ]
   }
+```
+
 ```shell
 cd ~/Med_SNP_Deconvolution
 PYTHONPATH=$PWD:$PYTHONPATH nvflare simulator -w workspace -n 3 -t 3 snp_deconvolution/nvflare_jobs/xgboost_fedavg/my_job
-
 ```
 
 ### Lightning model federal learning
