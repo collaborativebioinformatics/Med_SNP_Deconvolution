@@ -1,7 +1,7 @@
 """
 XGBoost数据加载器 - 用于NVFlare联邦训练
 
-官方要求：实现load_data()方法返回XGBoost DMatrix
+官方要求：继承XGBDataLoader基类，实现load_data()方法返回XGBoost DMatrix
 Reference: https://nvflare.readthedocs.io/en/2.5.1/user_guide/federated_xgboost/
 
 This data loader is called by FedXGBHistogramExecutor during federated training.
@@ -14,10 +14,17 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
+# Import NVFlare XGBDataLoader base class
+try:
+    from nvflare.app_opt.xgboost.data_loader import XGBDataLoader
+except ImportError:
+    # Fallback for older versions
+    XGBDataLoader = object
+
 logger = logging.getLogger(__name__)
 
 
-class SNPXGBDataLoader:
+class SNPXGBDataLoader(XGBDataLoader):
     """
     被 FedXGBHistogramExecutor 调用的数据加载器
 
@@ -61,28 +68,53 @@ class SNPXGBDataLoader:
         self.label_column = label_column
         self.enable_categorical = enable_categorical
 
-        logger.info(f"Initialized SNPXGBDataLoader for site: {site_name}")
+        # Normalize site name (site-1 -> site1)
+        self.normalized_site_name = self._normalize_site_name(site_name)
+
+        logger.info(f"Initialized SNPXGBDataLoader for site: {site_name} (normalized: {self.normalized_site_name})")
         logger.info(f"Data directory: {self.data_dir}")
         logger.info(f"Use cluster features: {use_cluster_features}")
         logger.info(f"Validation split: {validation_split}")
+
+    def _normalize_site_name(self, site_name: str) -> str:
+        """Normalize site name: site-1 -> site1"""
+        normalized = site_name.replace('-', '')
+        # Check if normalized version exists
+        if (self.data_dir / normalized).exists():
+            return normalized
+        return site_name
 
     def _load_raw_data(self) -> pd.DataFrame:
         """
         加载原始数据文件
 
         支持的文件格式：
-        1. {site_name}_train.csv
-        2. {site_name}.csv
-        3. site_{site_name}.csv
+        1. NPZ格式: {site_name}/train_cluster.npz
+        2. CSV格式: {site_name}_train.csv, {site_name}.csv
 
         Returns:
             DataFrame with features and labels
         """
-        # 尝试多种文件命名模式
+        # 首先尝试 NPZ 格式 (from prepare_federated_data.py)
+        npz_train = self.data_dir / self.normalized_site_name / "train_cluster.npz"
+        if npz_train.exists():
+            logger.info(f"Loading NPZ data from: {npz_train}")
+            train_data = np.load(npz_train)
+            X = train_data['X']
+            y = train_data['y']
+
+            # Convert to DataFrame format
+            df = pd.DataFrame(X, columns=[f'feature_{i}' for i in range(X.shape[1])])
+            df['label'] = y
+            logger.info(f"Loaded {len(df)} samples with {X.shape[1]} features from NPZ")
+            return df
+
+        # 尝试多种CSV文件命名模式
         possible_files = [
+            self.data_dir / f"{self.normalized_site_name}_train.csv",
+            self.data_dir / f"{self.normalized_site_name}.csv",
             self.data_dir / f"{self.site_name}_train.csv",
             self.data_dir / f"{self.site_name}.csv",
-            self.data_dir / f"site_{self.site_name}.csv",
         ]
 
         data_file = None
@@ -94,10 +126,10 @@ class SNPXGBDataLoader:
         if data_file is None:
             raise FileNotFoundError(
                 f"Could not find data file for site {self.site_name}. "
-                f"Tried: {[str(f) for f in possible_files]}"
+                f"Tried NPZ: {npz_train}, CSV: {[str(f) for f in possible_files]}"
             )
 
-        logger.info(f"Loading data from: {data_file}")
+        logger.info(f"Loading CSV data from: {data_file}")
         df = pd.read_csv(data_file)
         logger.info(f"Loaded {len(df)} samples with {len(df.columns)} columns")
 
