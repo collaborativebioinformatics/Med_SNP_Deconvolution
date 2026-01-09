@@ -45,7 +45,11 @@ def main():
         gpu_available = False
         detected_gpu_id = None
 
-    use_gpu = cfg["pipeline"].get("gpu", gpu_available)
+    gpu_cfg = cfg["pipeline"].get("gpu", "auto")
+    if gpu_cfg == "auto":
+        use_gpu = gpu_available
+    else:
+        use_gpu = bool(gpu_cfg)
     gpu_id = cfg["pipeline"].get("gpu_id", detected_gpu_id if gpu_available else None)
 
     if use_gpu and gpu_id is None:
