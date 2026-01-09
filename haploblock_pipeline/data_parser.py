@@ -111,7 +111,7 @@ def parse_variants_of_interest(variants_file):
 # ---------------------------------------------------------------------
 # VCF / FASTA extraction (unchanged, I/O bound)
 # ---------------------------------------------------------------------
-def extract_region_from_vcf(vcf, chr, chr_map, start, end, out):
+def extract_region_from_vcf(vcf, chr, chr_map, start, end, out, threads=4):
     if chr.startswith("chr"):
         chr = chr.replace("chr", "")
 
@@ -124,28 +124,29 @@ def extract_region_from_vcf(vcf, chr, chr_map, start, end, out):
         ["bcftools", "view",
          "-r", f"{chr}:{start}-{end}",
          "--min-af", "0.05",
+         "--threads", str(threads),
          vcf,
          "-o", temp_vcf],
         check=True,
     )
-    subprocess.run(["bcftools", "index", temp_vcf], check=True)
+    subprocess.run(["bcftools", "index", "--threads", str(threads), temp_vcf], check=True)
 
     output_vcf = tmp_dir / f"chr{chr}_region_{start}-{end}.vcf"
     subprocess.run(
-        ["bcftools", "annotate", "--rename-chrs", chr_map, temp_vcf],
+        ["bcftools", "annotate", "--rename-chrs", chr_map, "--threads", str(threads), temp_vcf],
         stdout=open(output_vcf, "w"),
         check=True,
     )
-    subprocess.run(["bgzip", output_vcf], check=True)
+    subprocess.run(["bgzip", "-@", str(threads), output_vcf], check=True)
     subprocess.run(
-        ["bcftools", "index", "-c", output_vcf.with_suffix(".vcf.gz")],
+        ["bcftools", "index", "-c", "--threads", str(threads), output_vcf.with_suffix(".vcf.gz")],
         check=True,
     )
 
     return output_vcf.with_suffix(".vcf.gz")
 
 
-def extract_sample_from_vcf(vcf, sample, out):
+def extract_sample_from_vcf(vcf, sample, out, threads=4):
     tmp_dir = pathlib.Path(out) / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -155,11 +156,12 @@ def extract_sample_from_vcf(vcf, sample, out):
         ["bcftools", "view",
          "--force-samples",
          "-s", sample,
+         "--threads", str(threads),
          "-o", output_vcf,
          str(vcf)],
         check=True,
     )
-    subprocess.run(["bcftools", "index", output_vcf], check=True)
+    subprocess.run(["bcftools", "index", "--threads", str(threads), output_vcf], check=True)
     return output_vcf
 
 

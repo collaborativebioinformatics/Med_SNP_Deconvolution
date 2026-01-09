@@ -76,20 +76,20 @@ def gpu_count_variants(vcf: pathlib.Path, gpu_id=0) -> Tuple[int, int]:
 # -------------------------------------------------------------------------
 # VCF processing
 # -------------------------------------------------------------------------
-def normalize_and_filter_vcf(vcf: pathlib.Path, ref: pathlib.Path, out_dir: pathlib.Path) -> pathlib.Path:
+def normalize_and_filter_vcf(vcf: pathlib.Path, ref: pathlib.Path, out_dir: pathlib.Path, threads: int = 4) -> pathlib.Path:
     """Normalize and filter VCF in one pipeline, return filtered BCF path."""
     tmp_dir = out_dir / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     filtered_bcf = tmp_dir / f"{vcf.stem}.norm_flt.bcf"
 
     with open(filtered_bcf, "wb") as out_f:
-        p1 = subprocess.Popen(["bcftools", "norm", "-f", str(ref), "-Ob", str(vcf)], stdout=subprocess.PIPE)
-        p2 = subprocess.Popen(["bcftools", "filter", "--IndelGap", "5", "-e", "QUAL<40", "-Ob"],
+        p1 = subprocess.Popen(["bcftools", "norm", "-f", str(ref), "-Ob", "--threads", str(threads), str(vcf)], stdout=subprocess.PIPE)
+        p2 = subprocess.Popen(["bcftools", "filter", "--IndelGap", "5", "-e", "QUAL<40", "-Ob", "--threads", str(threads)],
                               stdin=p1.stdout, stdout=out_f)
         p2.communicate()
 
     # Index the BCF for bcftools consensus
-    subprocess.run(["bcftools", "index", "-c", str(filtered_bcf)], check=True)
+    subprocess.run(["bcftools", "index", "-c", "--threads", str(threads), str(filtered_bcf)], check=True)
 
     return filtered_bcf
 
@@ -126,16 +126,16 @@ def generate_consensus_fasta(ref: pathlib.Path,
 # -------------------------------------------------------------------------
 # Worker function for Pool
 # -------------------------------------------------------------------------
-def _process_sample_for_region(args, gpu=False, gpu_id=0, tmp_dir=None):
+def _process_sample_for_region(args, gpu=False, gpu_id=0, tmp_dir=None, threads=2):
     sample, region_vcf, region_fasta, ref, out_dir = args
     logger.info("Processing sample %s on %s", sample, "GPU" if gpu else "CPU")
 
     try:
         # Extract single sample VCF
-        sample_vcf = data_parser.extract_sample_from_vcf(region_vcf, sample, out_dir)
+        sample_vcf = data_parser.extract_sample_from_vcf(region_vcf, sample, out_dir, threads=threads)
 
         # Normalize + filter
-        filtered_vcf = normalize_and_filter_vcf(sample_vcf, ref, out_dir)
+        filtered_vcf = normalize_and_filter_vcf(sample_vcf, ref, out_dir, threads=threads)
 
         # Variant counting
         if gpu:
@@ -191,7 +191,8 @@ def run_phased_sequences(boundaries_file: pathlib.Path,
         logger.warning("No samples found; proceeding with empty sample list.")
 
     workers = workers or cpu_count()
-    logger.info("Using %d worker(s) (available cores: %d)", workers, cpu_count())
+    bcf_threads = max(1, cpu_count() // workers)  # threads per worker for bcftools
+    logger.info("Using %d worker(s) (available cores: %d), %d threads per bcftools call", workers, cpu_count(), bcf_threads)
     logger.info("GPU mode: %s (gpu_id=%d)", gpu, gpu_id)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -201,16 +202,16 @@ def run_phased_sequences(boundaries_file: pathlib.Path,
     # Prepare work list: all (sample, haploblock)
     work = []
     for start, end in haploblocks:
-        region_vcf = data_parser.extract_region_from_vcf(vcf, chrom, chr_map, start, end, out_dir)
+        region_vcf = data_parser.extract_region_from_vcf(vcf, chrom, chr_map, start, end, out_dir, threads=cpu_count())
         region_fasta = data_parser.extract_region_from_fasta(ref, chrom, start, end, out_dir)
         work.extend([(s, region_vcf, region_fasta, ref, out_dir) for s in samples])
 
     # Multiprocessing
     if workers == 1:
-        results = [_process_sample_for_region(w, gpu=gpu, gpu_id=gpu_id, tmp_dir=tmp_dir) for w in work]
+        results = [_process_sample_for_region(w, gpu=gpu, gpu_id=gpu_id, tmp_dir=tmp_dir, threads=bcf_threads) for w in work]
     else:
         with Pool(workers) as pool:
-            results = pool.map(partial(_process_sample_for_region, gpu=gpu, gpu_id=gpu_id, tmp_dir=tmp_dir), work)
+            results = pool.map(partial(_process_sample_for_region, gpu=gpu, gpu_id=gpu_id, tmp_dir=tmp_dir, threads=bcf_threads), work)
 
     # Aggregate variant counts per haploblock
     haploblock2count = {}
