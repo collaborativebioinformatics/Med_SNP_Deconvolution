@@ -334,29 +334,10 @@ def create_job_with_recipe(
         min_clients=min_clients if min_clients else len(clients),
     )
 
-    # Add model persistor for saving global model checkpoints
-    # In NVFlare 2.7+, use PTModel wrapper which auto-configures PTFileModelPersistor
-    persistor_id = None
-    try:
-        from nvflare.app_opt.pt.job_config.model import PTModel
-        import torch.nn as nn
-
-        # Create a dummy model structure for persistor (actual weights come from clients)
-        # This is needed for PTFileModelPersistor to know the model structure
-        class DummyModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.placeholder = nn.Linear(1, 1)
-            def forward(self, x):
-                return x
-
-        model_component = PTModel(DummyModel())
-        component_ids = job.to_server(model_component)
-        persistor_id = component_ids.get("persistor_id", "persistor")
-        logger.info(f"Added PTModel with persistor_id={persistor_id} for global model saving")
-    except (ImportError, Exception) as e:
-        logger.warning(f"PTModel not available: {e}, trying without persistor")
-        persistor_id = None
+    # Note: Server-side model persistence is handled by client checkpoints
+    # Each client saves its best model to ./checkpoints/{site_name}/
+    # The global model can be reconstructed from client updates if needed
+    logger.info("Model saving: Client checkpoints enabled (./checkpoints/)")
 
     # Create controller directly for better NVFlare 2.7.x compatibility
     # Note: Using FedAvg directly instead of registry for FedAvg/FedProx
@@ -366,16 +347,14 @@ def create_job_with_recipe(
         controller = FedAvg(
             num_clients=len(clients),
             num_rounds=num_rounds,
-            persistor_id=persistor_id if persistor_id else "",
         )
-        logger.info(f"Created FedAvg controller (strategy={strategy}, persistor_id={persistor_id})")
+        logger.info(f"Created FedAvg controller (strategy={strategy})")
     elif strategy.lower() == 'scaffold':
         logger.warning("SCAFFOLD requires special client implementation - falling back to FedAvg")
         from nvflare.app_common.workflows.fedavg import FedAvg
         controller = FedAvg(
             num_clients=len(clients),
             num_rounds=num_rounds,
-            persistor_id=persistor_id if persistor_id else "",
         )
     elif strategy.lower() == 'fedopt':
         # Use custom FedOpt controller
