@@ -208,6 +208,20 @@ def run_phased_sequences(boundaries_file: pathlib.Path,
     tmp_dir = out_dir / "tmp"
     (tmp_dir / "consensus_fasta").mkdir(parents=True, exist_ok=True)
 
+    # Pre-index FASTA to avoid race condition in parallel extraction
+    fai_file = ref.with_suffix(ref.suffix + ".fai")
+    if not fai_file.exists():
+        logger.info("Creating FASTA index: %s", fai_file)
+        subprocess.run(["samtools", "faidx", str(ref)], check=True)
+
+    # Pre-index VCF to avoid race condition in parallel extraction
+    # bcftools uses .csi for vcf.gz by default, .tbi is also possible
+    vcf_index_csi = vcf.with_suffix(vcf.suffix + ".csi")
+    vcf_index_tbi = vcf.with_suffix(vcf.suffix + ".tbi")
+    if not vcf_index_csi.exists() and not vcf_index_tbi.exists():
+        logger.info("Creating VCF index: %s", vcf_index_csi)
+        subprocess.run(["bcftools", "index", "--threads", str(workers), str(vcf)], check=True)
+
     # Prepare work list: all (sample, haploblock)
     # Parallelize region extraction using ThreadPoolExecutor (I/O-bound)
     logger.info("Extracting regions from VCF/FASTA (parallel)...")

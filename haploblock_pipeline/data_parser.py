@@ -166,8 +166,8 @@ def extract_sample_from_vcf(vcf, sample, out, threads=4):
 
 
 def extract_region_from_fasta(fasta, chr, start, end, out):
-    subprocess.run(["samtools", "faidx", fasta], check=True)
-
+    # Note: FASTA index (.fai) must be created before calling this function
+    # to avoid race conditions in parallel execution
     tmp_dir = pathlib.Path(out) / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
