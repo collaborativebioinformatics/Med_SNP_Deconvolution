@@ -420,8 +420,6 @@ class FedOptController(FedAvg):
         ignore_result_error: bool = False,
         allow_empty_global_weights: bool = False,
         task_check_period: float = 0.5,
-        persist_every_n_rounds: int = 1,
-        snapshot_every_n_rounds: int = 1,
         **kwargs
     ):
         """
@@ -440,8 +438,6 @@ class FedOptController(FedAvg):
             ignore_result_error: Whether to ignore errors in client results
             allow_empty_global_weights: Whether to allow empty global weights
             task_check_period: Period for checking task status (seconds)
-            persist_every_n_rounds: Save model every N rounds
-            snapshot_every_n_rounds: Snapshot workspace every N rounds
             **kwargs: Additional arguments passed to FedAvg
         """
         # Initialize parent FedAvg class
@@ -452,8 +448,6 @@ class FedOptController(FedAvg):
             ignore_result_error=ignore_result_error,
             allow_empty_global_weights=allow_empty_global_weights,
             task_check_period=task_check_period,
-            persist_every_n_rounds=persist_every_n_rounds,
-            snapshot_every_n_rounds=snapshot_every_n_rounds,
             **kwargs
         )
 
