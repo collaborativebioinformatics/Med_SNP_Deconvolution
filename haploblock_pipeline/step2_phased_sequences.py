@@ -6,6 +6,7 @@ import argparse
 import pathlib
 import subprocess
 from multiprocessing import Pool, cpu_count
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Tuple, Dict, Optional
 
@@ -127,6 +128,13 @@ def generate_consensus_fasta(ref: pathlib.Path,
 # -------------------------------------------------------------------------
 # Worker function for Pool
 # -------------------------------------------------------------------------
+def _process_sample_for_region_indexed(indexed_args, gpu=False, gpu_id=0, tmp_dir=None, threads=2):
+    """Wrapper that preserves index for imap_unordered reordering."""
+    idx, args = indexed_args
+    result = _process_sample_for_region(args, gpu=gpu, gpu_id=gpu_id, tmp_dir=tmp_dir, threads=threads)
+    return idx, result
+
+
 def _process_sample_for_region(args, gpu=False, gpu_id=0, tmp_dir=None, threads=2):
     sample, region_vcf, region_fasta, ref, out_dir = args
     logger.info("Processing sample %s on %s", sample, "GPU" if gpu else "CPU")
@@ -201,24 +209,53 @@ def run_phased_sequences(boundaries_file: pathlib.Path,
     (tmp_dir / "consensus_fasta").mkdir(parents=True, exist_ok=True)
 
     # Prepare work list: all (sample, haploblock)
-    logger.info("Extracting regions from VCF/FASTA...")
-    work = []
-    for start, end in tqdm(haploblocks, desc="Extracting regions", unit="block"):
-        region_vcf = data_parser.extract_region_from_vcf(vcf, chrom, chr_map, start, end, out_dir, threads=cpu_count())
+    # Parallelize region extraction using ThreadPoolExecutor (I/O-bound)
+    logger.info("Extracting regions from VCF/FASTA (parallel)...")
+
+    def extract_region(block):
+        start, end = block
+        region_vcf = data_parser.extract_region_from_vcf(vcf, chrom, chr_map, start, end, out_dir, threads=max(1, cpu_count() // 4))
         region_fasta = data_parser.extract_region_from_fasta(ref, chrom, start, end, out_dir)
+        return start, end, region_vcf, region_fasta
+
+    # Use 4 threads for parallel region extraction (I/O-bound, limited by disk)
+    region_workers = min(4, len(haploblocks))
+    with ThreadPoolExecutor(max_workers=region_workers) as executor:
+        extracted_regions = list(tqdm(
+            executor.map(extract_region, haploblocks),
+            total=len(haploblocks),
+            desc="Extracting regions",
+            unit="block"
+        ))
+
+    work = []
+    for start, end, region_vcf, region_fasta in extracted_regions:
         work.extend([(s, region_vcf, region_fasta, ref, out_dir) for s in samples])
 
-    # Multiprocessing
-    logger.info("Processing %d sample-region pairs...", len(work))
+    # Multiprocessing with optimized chunk size for better load balancing
+    logger.info("Processing %d sample-region pairs with %d workers...", len(work), workers)
+    # Optimal chunk size: balance between overhead and load distribution
+    chunksize = max(1, len(work) // (workers * 4))
+
     if workers == 1:
         results = [_process_sample_for_region(w, gpu=gpu, gpu_id=gpu_id, tmp_dir=tmp_dir, threads=bcf_threads)
                    for w in tqdm(work, desc="Processing samples", unit="sample")]
     else:
         with Pool(workers) as pool:
-            results = list(tqdm(
-                pool.imap(partial(_process_sample_for_region, gpu=gpu, gpu_id=gpu_id, tmp_dir=tmp_dir, threads=bcf_threads), work),
+            # Use imap_unordered for better throughput (results may arrive out of order)
+            indexed_work = list(enumerate(work))
+            indexed_worker = partial(
+                _process_sample_for_region_indexed,
+                gpu=gpu, gpu_id=gpu_id, tmp_dir=tmp_dir, threads=bcf_threads
+            )
+
+            raw_results = list(tqdm(
+                pool.imap_unordered(indexed_worker, indexed_work, chunksize=chunksize),
                 total=len(work), desc="Processing samples", unit="sample"
             ))
+            # Reorder results by original index
+            raw_results.sort(key=lambda x: x[0])
+            results = [r[1] for r in raw_results]
 
     # Aggregate variant counts per haploblock
     haploblock2count = {}
