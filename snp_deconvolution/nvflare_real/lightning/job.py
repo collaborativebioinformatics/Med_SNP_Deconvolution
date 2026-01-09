@@ -334,6 +334,16 @@ def create_job_with_recipe(
         min_clients=min_clients if min_clients else len(clients),
     )
 
+    # Add model persistor for saving global model checkpoints
+    try:
+        from nvflare.app_opt.pt.file_model_persistor import PTFileModelPersistor
+        persistor = PTFileModelPersistor(model_dir="models")
+        job.to_server(persistor, id="persistor")
+        logger.info("Added PTFileModelPersistor for global model saving")
+    except ImportError:
+        logger.warning("PTFileModelPersistor not available, global model will not be saved")
+        persistor = None
+
     # Create controller directly for better NVFlare 2.7.x compatibility
     # Note: Using FedAvg directly instead of registry for FedAvg/FedProx
     # SCAFFOLD support requires additional client-side implementation
@@ -342,6 +352,7 @@ def create_job_with_recipe(
         controller = FedAvg(
             num_clients=len(clients),
             num_rounds=num_rounds,
+            persistor_id="persistor" if persistor else "",
         )
         logger.info(f"Created FedAvg controller (strategy={strategy})")
     elif strategy.lower() == 'scaffold':
@@ -350,6 +361,7 @@ def create_job_with_recipe(
         controller = FedAvg(
             num_clients=len(clients),
             num_rounds=num_rounds,
+            persistor_id="persistor" if persistor else "",
         )
     elif strategy.lower() == 'fedopt':
         # Use custom FedOpt controller
@@ -384,7 +396,9 @@ def create_job_with_recipe(
         f"--batch_size {batch_size} "
         f"--learning_rate {learning_rate} "
         f"--use_focal_loss "
-        f"--precision bf16-mixed"
+        f"--precision bf16-mixed "
+        f"--checkpoint_dir ./checkpoints "
+        f"--save_top_k 3"
     )
 
     # Add strategy-specific arguments for client

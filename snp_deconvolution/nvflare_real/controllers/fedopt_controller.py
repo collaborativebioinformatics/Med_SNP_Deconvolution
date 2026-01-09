@@ -541,7 +541,8 @@ class FedOptController(FedAvg):
     def aggregate(
         self,
         shareable_list: List[Shareable],
-        fl_ctx: FLContext
+        fl_ctx: FLContext,
+        aggregate_fn=None,  # Added for NVFlare 2.7.x compatibility
     ) -> Shareable:
         """
         Aggregate client models using FedOpt algorithm.
@@ -554,6 +555,7 @@ class FedOptController(FedAvg):
         Args:
             shareable_list: List of shareables from clients
             fl_ctx: FL context
+            aggregate_fn: Optional aggregate function (for NVFlare 2.7.x compatibility, ignored in FedOpt)
 
         Returns:
             Aggregated shareable with updated global model
@@ -566,7 +568,7 @@ class FedOptController(FedAvg):
 
         if current_global is None:
             logger.warning("No global model available, falling back to FedAvg aggregation")
-            return super().aggregate(shareable_list, fl_ctx)
+            return super().aggregate(shareable_list, fl_ctx, aggregate_fn=aggregate_fn)
 
         # Store current global model as numpy arrays for FedOpt computation
         if self.previous_global_model is None:
@@ -605,7 +607,7 @@ class FedOptController(FedAvg):
 
         if not client_deltas:
             logger.error("No valid client deltas, cannot perform FedOpt aggregation")
-            return super().aggregate(shareable_list, fl_ctx)
+            return super().aggregate(shareable_list, fl_ctx, aggregate_fn=aggregate_fn)
 
         # Compute weighted average of deltas as pseudo-gradient
         # pseudo_gradient = sum(n_i * delta_i) / sum(n_i)
