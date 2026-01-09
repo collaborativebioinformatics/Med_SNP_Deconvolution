@@ -354,10 +354,18 @@ class HaploblockLightningModule(pl.LightningModule):
             return torch.tensor(0.0, device=self.device)
 
         prox_term = torch.tensor(0.0, device=self.device)
-        for name, param in self.model.named_parameters():
+        matched_params = 0
+        # Use self.named_parameters() to match state_dict keys (includes 'model.' prefix)
+        for name, param in self.named_parameters():
             if name in self.global_model_state:
                 global_param = self.global_model_state[name].to(self.device)
                 prox_term = prox_term + torch.sum((param - global_param) ** 2)
+                matched_params += 1
+
+        if matched_params == 0:
+            logger.warning("FedProx: No parameters matched! Check state_dict key names.")
+        else:
+            logger.debug(f"FedProx: Matched {matched_params} parameters for proximal term")
 
         return (self.hparams.mu / 2.0) * prox_term
 

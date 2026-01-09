@@ -6,7 +6,7 @@
 import numpy as np
 import torch
 from pathlib import Path
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 from sklearn.model_selection import train_test_split
 from collections import Counter
 import logging
@@ -62,7 +62,8 @@ class FederatedDataSplitter:
         split_type: str = "iid",  # "iid", "dirichlet", "label_skew", "quantity_skew"
         alpha: float = 0.5,  # Dirichlet分布的alpha参数，仅在split_type="dirichlet"时使用
         min_ratio: float = 0.1,  # quantity_skew模式下的最小比例
-        labels_per_site: int = 2  # label_skew模式下每个站点的类别数
+        labels_per_site: int = 2,  # label_skew模式下每个站点的类别数
+        vocab_sizes: List[int] = None  # cluster特征的词汇表大小（用于Embedding层）
     ) -> Dict[str, Dict[str, Any]]:
         """
         划分数据并保存到各站点目录
@@ -160,8 +161,8 @@ class FederatedDataSplitter:
             logger.info(f"训练集: {len(X_train)} 样本, 标签分布: {dict(Counter(y_train))}")
             logger.info(f"验证集: {len(X_val)} 样本, 标签分布: {dict(Counter(y_val))}")
 
-            # 保存数据
-            self._save_site_data(site_dir, X_train, y_train, X_val, y_val, feature_type)
+            # 保存数据（包括vocab_sizes用于embedding层）
+            self._save_site_data(site_dir, X_train, y_train, X_val, y_val, feature_type, vocab_sizes)
 
             # 收集统计信息
             stats[site_name] = {
@@ -569,7 +570,8 @@ class FederatedDataSplitter:
         y_train: np.ndarray,
         X_val: np.ndarray,
         y_val: np.ndarray,
-        feature_type: str
+        feature_type: str,
+        vocab_sizes: List[int] = None
     ) -> None:
         """
         保存单个站点数据
@@ -581,29 +583,38 @@ class FederatedDataSplitter:
             X_val: 验证特征
             y_val: 验证标签
             feature_type: 特征类型
+            vocab_sizes: cluster特征的词汇表大小列表（用于Embedding层）
         """
         # 保存PyTorch格式（用于Lightning）
+        # cluster 特征需要使用 long 类型（用于 Embedding 层）
+        # snp 特征使用 float32 类型
+        x_dtype = torch.long if feature_type == 'cluster' else torch.float32
+
         torch.save({
-            'X': torch.tensor(X_train, dtype=torch.float32),
+            'X': torch.tensor(X_train, dtype=x_dtype),
             'y': torch.tensor(y_train, dtype=torch.long)
         }, site_dir / f'train_{feature_type}.pt')
 
         torch.save({
-            'X': torch.tensor(X_val, dtype=torch.float32),
+            'X': torch.tensor(X_val, dtype=x_dtype),
             'y': torch.tensor(y_val, dtype=torch.long)
         }, site_dir / f'val_{feature_type}.pt')
 
-        # 保存NumPy格式（用于XGBoost）
-        np.savez(
-            site_dir / f'train_{feature_type}.npz',
-            X=X_train,
-            y=y_train
-        )
-        np.savez(
-            site_dir / f'val_{feature_type}.npz',
-            X=X_val,
-            y=y_val
-        )
+        # 保存NumPy格式（用于XGBoost和Lightning的另一种加载方式）
+        # cluster 特征保存为 int64，snp 特征保存为 float32
+        x_np_dtype = np.int64 if feature_type == 'cluster' else np.float32
+
+        # 构建保存字典，包含vocab_sizes（如果有）
+        train_data = {'X': X_train.astype(x_np_dtype), 'y': y_train}
+        val_data = {'X': X_val.astype(x_np_dtype), 'y': y_val}
+
+        if vocab_sizes is not None:
+            train_data['vocab_sizes'] = np.array(vocab_sizes, dtype=np.int64)
+            val_data['vocab_sizes'] = np.array(vocab_sizes, dtype=np.int64)
+            logger.info(f"保存 vocab_sizes: {len(vocab_sizes)} 个, max={max(vocab_sizes)}")
+
+        np.savez(site_dir / f'train_{feature_type}.npz', **train_data)
+        np.savez(site_dir / f'val_{feature_type}.npz', **val_data)
 
         logger.info(f"已保存数据到 {site_dir}:")
         logger.info(f"  - train_{feature_type}.pt / train_{feature_type}.npz")

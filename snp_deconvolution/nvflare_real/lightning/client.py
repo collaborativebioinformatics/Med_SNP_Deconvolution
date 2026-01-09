@@ -327,14 +327,19 @@ def run_federated_client(args):
     logger.info(f"Local epochs per round: {args.local_epochs}")
 
     # Step 3: Create data module for this site
+    # For haploblock model, keep 2D data (model has internal Embedding layer)
+    # For snp model, encode 2D to 3D (model expects encoded input)
+    keep_2d = (args.model_type == 'haploblock')
     data_module = SNPFederatedDataModule(
         data_dir=args.data_dir,
         site_name=site_name,
         feature_type=args.feature_type,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        keep_2d=keep_2d,
     )
     data_module.setup()
+    logger.info(f"Model type: {args.model_type}, keep_2d={keep_2d}")
 
     # Get actual feature dimensions from data
     sample_batch = next(iter(data_module.train_dataloader()))
@@ -346,14 +351,40 @@ def run_federated_client(args):
         # 2D data: (batch, n_haploblocks) - cluster IDs
         logger.info(f"Detected 2D data (haploblock cluster IDs): shape={X_sample.shape}")
         actual_encoding_dim = None
+        vocab_sizes = None
 
-        # Compute vocab sizes from all training data
-        all_data = data_module.train_dataset.tensors[0]
-        vocab_sizes = []
-        for i in range(n_features):
-            max_val = int(all_data[:, i].max().item()) + 1
-            vocab_sizes.append(max(max_val + 1, 2))  # +1 for padding, min 2
-        logger.info(f"Computed vocab sizes: {vocab_sizes[:5]}... max={max(vocab_sizes)}")
+        # Priority 1: Try to get vocab_sizes from data module (loaded from npz file)
+        if hasattr(data_module, 'vocab_sizes') and data_module.vocab_sizes is not None:
+            vocab_sizes = data_module.vocab_sizes
+            logger.info(f"Loaded vocab_sizes from data module: {vocab_sizes[:5]}... max={max(vocab_sizes)}")
+
+        # Priority 2: Try to load vocab_sizes from metadata file
+        if not vocab_sizes:
+            import json
+            metadata_file = Path(args.data_dir) / 'dataset_metadata.json'
+            if metadata_file.exists():
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+                vocab_sizes = metadata.get('dataset', {}).get('vocab_sizes', None)
+                if vocab_sizes:
+                    logger.info(f"Loaded vocab_sizes from metadata: {vocab_sizes[:5]}... max={max(vocab_sizes)}")
+                else:
+                    vocab_sizes = None
+
+        # Fallback: compute from data (may be inaccurate for split data - WARN!)
+        if not vocab_sizes:
+            logger.error("="*60)
+            logger.error("CRITICAL: No vocab_sizes found in data or metadata!")
+            logger.error("This will likely cause embedding index errors.")
+            logger.error("Please re-run prepare_federated_data.py to generate correct data.")
+            logger.error("="*60)
+            # Still compute as fallback but with warning
+            all_data = data_module.train_dataset.tensors[0]
+            vocab_sizes = []
+            for i in range(n_features):
+                max_val = int(all_data[:, i].max().item()) + 1
+                vocab_sizes.append(max(max_val + 1, 2))  # +1 for padding, min 2
+            logger.warning(f"Computed vocab sizes (UNRELIABLE): {vocab_sizes[:5]}... max={max(vocab_sizes)}")
     else:
         # 3D data: (batch, n_snps, encoding_dim)
         actual_encoding_dim = X_sample.shape[2]

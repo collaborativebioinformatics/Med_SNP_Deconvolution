@@ -93,6 +93,7 @@ class SNPFederatedDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         pin_memory: bool = True,
         drop_last: bool = False,
+        keep_2d: bool = False,  # Keep 2D data for embedding models (HaploblockTransformer)
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -102,6 +103,7 @@ class SNPFederatedDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.drop_last = drop_last
+        self.keep_2d = keep_2d
 
         # Data attributes (set after setup)
         self.train_dataset: Optional[TensorDataset] = None
@@ -110,6 +112,7 @@ class SNPFederatedDataModule(pl.LightningDataModule):
         self.n_features: Optional[int] = None
         self.encoding_dim: Optional[int] = None
         self.num_classes: Optional[int] = None
+        self.vocab_sizes: Optional[list] = None  # For cluster features (embedding layer)
 
         # Validate feature type
         if feature_type not in ['cluster', 'snp']:
@@ -284,10 +287,23 @@ class SNPFederatedDataModule(pl.LightningDataModule):
                 raise IOError(f"Failed to load split files from {data_path}: {e}")
 
             # Extract data from split files
-            X_train = torch.from_numpy(train_data['X']).float()
+            # Use long type for cluster IDs (embedding), float for encoded SNP data
+            if self.keep_2d:
+                X_train = torch.from_numpy(train_data['X']).long()
+                X_val = torch.from_numpy(val_data['X']).long()
+            else:
+                X_train = torch.from_numpy(train_data['X']).float()
+                X_val = torch.from_numpy(val_data['X']).float()
             y_train = torch.from_numpy(train_data['y']).long()
-            X_val = torch.from_numpy(val_data['X']).float()
             y_val = torch.from_numpy(val_data['y']).long()
+
+            # Load vocab_sizes from npz file if available (for embedding layer)
+            if 'vocab_sizes' in train_data:
+                self.vocab_sizes = train_data['vocab_sizes'].tolist()
+                logger.info(f"Loaded vocab_sizes from npz: {len(self.vocab_sizes)} haploblocks, max={max(self.vocab_sizes)}")
+            else:
+                self.vocab_sizes = None
+                logger.info("No vocab_sizes in npz file")
 
             # Use validation set as test set if no separate test set
             X_test = X_val.clone()
@@ -303,6 +319,12 @@ class SNPFederatedDataModule(pl.LightningDataModule):
             except Exception as e:
                 raise IOError(f"Failed to load {data_path}: {e}")
 
+            # Helper to convert with correct dtype
+            def to_tensor(arr):
+                if self.keep_2d:
+                    return torch.from_numpy(arr).long()
+                return torch.from_numpy(arr).float()
+
             # Check for required fields
             required_fields = ['X_train', 'y_train', 'X_val', 'y_val']
             missing_fields = [f for f in required_fields if f not in data]
@@ -310,7 +332,7 @@ class SNPFederatedDataModule(pl.LightningDataModule):
                 # Try alternative format: X, y in single file
                 if 'X' in data and 'y' in data:
                     logger.warning("Found X, y format - splitting into train/val/test")
-                    X = torch.from_numpy(data['X']).float()
+                    X = to_tensor(data['X'])
                     y = torch.from_numpy(data['y']).long()
                     n = len(X)
                     train_end = int(n * 0.7)
@@ -325,32 +347,38 @@ class SNPFederatedDataModule(pl.LightningDataModule):
                     )
             else:
                 # Standard combined format
-                X_train = torch.from_numpy(data['X_train']).float()
+                X_train = to_tensor(data['X_train'])
                 y_train = torch.from_numpy(data['y_train']).long()
-                X_val = torch.from_numpy(data['X_val']).float()
+                X_val = to_tensor(data['X_val'])
                 y_val = torch.from_numpy(data['y_val']).long()
 
                 # Test set is optional
                 if 'X_test' in data and 'y_test' in data:
-                    X_test = torch.from_numpy(data['X_test']).float()
+                    X_test = to_tensor(data['X_test'])
                     y_test = torch.from_numpy(data['y_test']).long()
                 else:
                     X_test = X_val.clone()
                     y_test = y_val.clone()
                     logger.info("No test set found, using validation set as test set")
 
-        # Handle 2D data (encode to 3D with proper encoding_dim)
+        # Handle 2D data
         if X_train.dim() == 2:
-            logger.info("Data is 2D, encoding cluster IDs to 3D format...")
-            encoding_dim = 8  # Standard encoding dimension for the model
-            X_train = self._encode_cluster_ids(X_train, encoding_dim)
-            X_val = self._encode_cluster_ids(X_val, encoding_dim)
-            X_test = self._encode_cluster_ids(X_test, encoding_dim)
+            if self.keep_2d:
+                # Keep 2D for embedding models (HaploblockTransformer)
+                # Model's internal Embedding layer will handle cluster IDs
+                logger.info("Keeping 2D data for embedding model (HaploblockTransformer)")
+            else:
+                # Encode to 3D for SNP models that expect (batch, n_features, encoding_dim)
+                logger.info("Data is 2D, encoding cluster IDs to 3D format...")
+                encoding_dim = 8  # Standard encoding dimension for the model
+                X_train = self._encode_cluster_ids(X_train, encoding_dim)
+                X_val = self._encode_cluster_ids(X_val, encoding_dim)
+                X_test = self._encode_cluster_ids(X_test, encoding_dim)
 
         # Validate shapes
-        if X_train.dim() != 3:
+        if X_train.dim() not in [2, 3]:
             raise ValueError(
-                f"Expected X_train to be 3D [n_samples, n_features, encoding_dim], "
+                f"Expected X_train to be 2D [n_samples, n_features] or 3D [n_samples, n_features, encoding_dim], "
                 f"got shape {X_train.shape}"
             )
 
@@ -365,7 +393,10 @@ class SNPFederatedDataModule(pl.LightningDataModule):
         logger.info(f"  Val:   {X_val.shape[0]} samples")
         logger.info(f"  Test:  {X_test.shape[0]} samples")
         logger.info(f"  Features: {X_train.shape[1]}")
-        logger.info(f"  Encoding dim: {X_train.shape[2]}")
+        if X_train.dim() == 3:
+            logger.info(f"  Encoding dim: {X_train.shape[2]}")
+        else:
+            logger.info(f"  Data format: 2D (cluster IDs for embedding)")
         logger.info(f"  Classes: {y_train.unique().tolist()}")
 
         return X_train, y_train, X_val, y_val, X_test, y_test
@@ -396,7 +427,8 @@ class SNPFederatedDataModule(pl.LightningDataModule):
 
         # Extract metadata
         self.n_features = X_train.shape[1]
-        self.encoding_dim = X_train.shape[2]
+        # Handle both 2D (haploblock) and 3D (SNP) data
+        self.encoding_dim = X_train.shape[2] if len(X_train.shape) == 3 else None
         self.num_classes = len(torch.unique(y_train))
 
         # Create datasets

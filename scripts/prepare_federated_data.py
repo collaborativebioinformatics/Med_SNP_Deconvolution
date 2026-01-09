@@ -333,6 +333,11 @@ def prepare_federated_data(args: argparse.Namespace) -> None:
                 'split_type': args.split_type
             }
 
+            # 传递vocab_sizes（用于Embedding层，仅cluster模式需要）
+            if mode == 'cluster' and 'vocab_sizes' in metadata:
+                split_kwargs['vocab_sizes'] = metadata['vocab_sizes']
+                logger.info(f"  Vocab sizes: {len(metadata['vocab_sizes'])} haploblocks, max={max(metadata['vocab_sizes'])}")
+
             # 根据划分类型添加额外参数
             if args.split_type == 'dirichlet':
                 split_kwargs['alpha'] = args.alpha
