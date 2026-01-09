@@ -10,6 +10,11 @@
 2. 加载人群标签
 3. 使用FederatedDataSplitter划分到各站点
 4. 支持cluster和SNP两种特征模式
+5. 支持多种数据划分策略:
+   - IID: 独立同分布
+   - Dirichlet: 非独立同分布 (使用Dirichlet分布)
+   - Label Skew: 标签偏斜 (每个站点只包含部分类别)
+   - Quantity Skew: 数量偏斜 (每个站点的数据量不同)
 """
 import argparse
 import logging
@@ -74,6 +79,18 @@ def validate_arguments(args: argparse.Namespace) -> None:
         vcf_path = Path(args.vcf_path)
         if not vcf_path.exists():
             raise ValueError(f"VCF文件不存在: {vcf_path}")
+
+    # 验证数据划分类型相关参数
+    if args.split_type == 'dirichlet' and args.alpha <= 0:
+        raise ValueError(f"Dirichlet alpha参数必须大于0: {args.alpha}")
+
+    if args.split_type == 'label_skew':
+        if args.labels_per_site < 1:
+            raise ValueError(f"每站点标签数必须至少为1: {args.labels_per_site}")
+
+    if args.split_type == 'quantity_skew':
+        if not 0 < args.min_ratio < 1:
+            raise ValueError(f"最小数据比例必须在(0, 1)之间: {args.min_ratio}")
 
 
 def load_and_prepare_data(
@@ -170,7 +187,11 @@ def save_metadata(
         'split_config': {
             'num_sites': args.num_sites,
             'val_ratio': args.val_ratio,
-            'seed': args.seed
+            'seed': args.seed,
+            'split_type': args.split_type,
+            'alpha': args.alpha if args.split_type == 'dirichlet' else None,
+            'labels_per_site': args.labels_per_site if args.split_type == 'label_skew' else None,
+            'min_ratio': args.min_ratio if args.split_type == 'quantity_skew' else None
         },
         'source': {
             'pipeline_output': str(args.pipeline_output),
@@ -218,6 +239,7 @@ def print_summary(
 
     print(f"\n站点配置:")
     print(f"  站点数量: {len(stats)}")
+    print(f"  划分类型: {metadata.get('split_type', 'iid')}")
 
     total_train = sum(s['train_samples'] for s in stats.values())
     total_val = sum(s['val_samples'] for s in stats.values())
@@ -300,13 +322,32 @@ def prepare_federated_data(args: argparse.Namespace) -> None:
             )
 
             # 划分并保存数据
-            logger.info("\n开始数据划分...")
-            stats = splitter.split_and_save(
-                X=X,
-                y=y,
-                val_ratio=args.val_ratio,
-                feature_type=mode
-            )
+            logger.info(f"\n开始数据划分 (split_type={args.split_type})...")
+
+            # 准备split_and_save的参数
+            split_kwargs = {
+                'X': X,
+                'y': y,
+                'val_ratio': args.val_ratio,
+                'feature_type': mode,
+                'split_type': args.split_type
+            }
+
+            # 根据划分类型添加额外参数
+            if args.split_type == 'dirichlet':
+                split_kwargs['alpha'] = args.alpha
+                logger.info(f"  Dirichlet concentration parameter: {args.alpha}")
+            elif args.split_type == 'label_skew':
+                split_kwargs['labels_per_site'] = args.labels_per_site
+                logger.info(f"  Labels per site: {args.labels_per_site}")
+            elif args.split_type == 'quantity_skew':
+                split_kwargs['min_ratio'] = args.min_ratio
+                logger.info(f"  Minimum data ratio per site: {args.min_ratio}")
+
+            stats = splitter.split_and_save(**split_kwargs)
+
+            # 将split_type添加到metadata中以便在print_summary中使用
+            metadata['split_type'] = args.split_type
 
             # 验证划分
             if args.verify:
@@ -342,21 +383,47 @@ def main():
         epilog="""
 示例用法:
 
-  1. 使用cluster特征准备3个站点的数据:
+  1. 使用IID划分准备3个站点的数据 (默认):
      python prepare_federated_data.py \\
          --pipeline_output out_dir/TNFa \\
          --num_sites 3 \\
          --output_dir data/federated/TNFa
 
-  2. 同时准备cluster和SNP特征:
+  2. 使用Dirichlet分布创建非IID数据划分:
+     python prepare_federated_data.py \\
+         --pipeline_output out_dir/TNFa \\
+         --num_sites 3 \\
+         --split_type dirichlet \\
+         --alpha 0.1 \\
+         --output_dir data/federated/TNFa_dirichlet
+
+  3. 使用标签偏斜 (每个站点只有部分类别):
+     python prepare_federated_data.py \\
+         --pipeline_output out_dir/TNFa \\
+         --num_sites 3 \\
+         --split_type label_skew \\
+         --labels_per_site 2 \\
+         --output_dir data/federated/TNFa_label_skew
+
+  4. 使用数量偏斜 (不同站点有不同数据量):
+     python prepare_federated_data.py \\
+         --pipeline_output out_dir/TNFa \\
+         --num_sites 3 \\
+         --split_type quantity_skew \\
+         --min_ratio 0.1 \\
+         --output_dir data/federated/TNFa_quantity_skew
+
+  5. 同时准备cluster和SNP特征:
      python prepare_federated_data.py \\
          --pipeline_output out_dir/TNFa \\
          --vcf_path data/chr6.vcf.gz \\
          --mode both \\
          --num_sites 3 \\
+         --split_type dirichlet \\
+         --alpha 0.5 \\
          --output_dir data/federated/TNFa
 
-  3. 自定义人群标签文件:
+  6. 自定义人群标签文件:
      python prepare_federated_data.py \\
          --pipeline_output out_dir/TNFa \\
          --population_files data/igsr-chb.tsv.tsv data/igsr-gbr.tsv.tsv \\
@@ -420,6 +487,49 @@ def main():
         type=int,
         default=42,
         help="随机种子 (默认: 42)"
+    )
+    parser.add_argument(
+        "--split_type",
+        "--split_method",
+        type=str,
+        default="iid",
+        choices=["iid", "dirichlet", "label_skew", "quantity_skew"],
+        dest="split_type",
+        help=(
+            "数据划分类型 (默认: iid):\n"
+            "  - iid: 独立同分布，每个站点的数据分布相同\n"
+            "  - dirichlet: 使用Dirichlet分布生成非独立同分布的数据划分\n"
+            "  - label_skew: 标签偏斜，每个站点只包含部分类别\n"
+            "  - quantity_skew: 数量偏斜，每个站点的数据量不同"
+        )
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.5,
+        help=(
+            "Dirichlet分布的浓度参数 (仅在split_type='dirichlet'时使用，默认: 0.5)。\n"
+            "较小的alpha值(例如0.1)会产生更不平衡的分布，\n"
+            "较大的alpha值(例如10.0)会产生更均衡的分布。"
+        )
+    )
+    parser.add_argument(
+        "--labels_per_site",
+        type=int,
+        default=2,
+        help=(
+            "每个站点包含的标签数量 (仅在split_type='label_skew'时使用，默认: 2)。\n"
+            "此参数控制每个站点的类别多样性。"
+        )
+    )
+    parser.add_argument(
+        "--min_ratio",
+        type=float,
+        default=0.1,
+        help=(
+            "每个站点的最小数据比例 (仅在split_type='quantity_skew'时使用，默认: 0.1)。\n"
+            "此参数确保每个站点至少获得总数据的这个比例。"
+        )
     )
 
     # 其他选项

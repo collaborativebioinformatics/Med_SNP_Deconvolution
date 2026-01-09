@@ -145,6 +145,21 @@ def parse_args():
         help='Focal loss gamma parameter'
     )
 
+    # Federated learning strategy arguments
+    parser.add_argument(
+        '--strategy',
+        type=str,
+        default='fedavg',
+        choices=['fedavg', 'fedprox', 'scaffold', 'fedopt'],
+        help='Federated learning strategy (fedavg, fedprox, scaffold, or fedopt)'
+    )
+    parser.add_argument(
+        '--mu',
+        type=float,
+        default=0.01,
+        help='FedProx proximal term coefficient (only used with --strategy fedprox)'
+    )
+
     # Hardware arguments
     parser.add_argument(
         '--precision',
@@ -187,6 +202,8 @@ def create_model(
     use_focal_loss: bool,
     focal_alpha: float,
     focal_gamma: float,
+    strategy: str = 'fedavg',
+    mu: float = 0.0,
 ) -> SNPLightningModule:
     """
     Create SNP Lightning model.
@@ -201,10 +218,15 @@ def create_model(
         use_focal_loss: Whether to use focal loss
         focal_alpha: Focal loss alpha
         focal_gamma: Focal loss gamma
+        strategy: Federated learning strategy ('fedavg' or 'fedprox')
+        mu: FedProx proximal coefficient (only used with strategy='fedprox')
 
     Returns:
         SNPLightningModule instance
     """
+    # Set mu based on strategy
+    effective_mu = mu if strategy == 'fedprox' else 0.0
+
     model = SNPLightningModule(
         n_snps=n_features,
         encoding_dim=encoding_dim,
@@ -216,8 +238,10 @@ def create_model(
         focal_alpha=focal_alpha,
         focal_gamma=focal_gamma,
         scheduler_type='cosine',
+        mu=effective_mu,
     )
     logger.info(f"Created model: arch={architecture}, n_features={n_features}, classes={num_classes}")
+    logger.info(f"Strategy: {strategy}, mu={effective_mu}")
     return model
 
 
@@ -271,7 +295,7 @@ def run_federated_client(args):
     logger.info(f"Data loaded: n_features={n_features}, encoding_dim={actual_encoding_dim}")
     logger.info(f"Train samples: {len(data_module.train_dataset)}, Val samples: {len(data_module.val_dataset)}")
 
-    # Step 4: Create model
+    # Step 4: Create model with federated learning strategy
     model = create_model(
         n_features=n_features,
         encoding_dim=actual_encoding_dim,
@@ -282,6 +306,8 @@ def run_federated_client(args):
         use_focal_loss=args.use_focal_loss,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
+        strategy=args.strategy,
+        mu=args.mu,
     )
 
     # Step 5: Configure accelerator
@@ -312,8 +338,19 @@ def run_federated_client(args):
         if input_model.params is not None and len(input_model.params) > 0:
             logger.info(f"Round {round_num}: Loading global model weights ({len(input_model.params)} parameters)...")
             try:
+                # FedProx: Store global model state BEFORE loading into local model
+                # This ensures we store the actual server weights, not the local model's weights
+                if args.strategy == 'fedprox':
+                    logger.info(f"Round {round_num}: Storing global model state for FedProx (mu={args.mu})...")
+                    model.global_model_state = {
+                        name: param.clone().detach().cpu()
+                        for name, param in input_model.params.items()
+                    }
+                    logger.info(f"Round {round_num}: Global model state stored ({len(model.global_model_state)} parameters)")
+
                 model.load_state_dict(input_model.params)
                 logger.info(f"Round {round_num}: Global model weights loaded successfully")
+
             except RuntimeError as e:
                 logger.error(f"Round {round_num}: Error loading state_dict: {e}")
                 if round_num == 0:
@@ -373,6 +410,11 @@ def run_federated_client(args):
         logger.info(f"Round {round_num}: Sending model updates to server...")
         flare.send(output_model)
         logger.info(f"Round {round_num}: Model updates sent successfully")
+
+        # Clear global_model_state to prevent memory leak
+        if hasattr(model, 'global_model_state') and model.global_model_state is not None:
+            model.global_model_state = None
+            logger.debug(f"Round {round_num}: Cleared global_model_state to free memory")
 
     logger.info(f"\n{'='*60}")
     logger.info(f"Federated learning completed after {round_num} rounds")

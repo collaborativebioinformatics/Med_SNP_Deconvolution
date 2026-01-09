@@ -70,6 +70,7 @@ class SNPLightningModule(pl.LightningModule):
         focal_alpha: Focal loss alpha
         focal_gamma: Focal loss gamma
         scheduler_type: 'cosine', 'plateau', or 'none'
+        mu: FedProx proximal coefficient (default: 0.0 for FedAvg)
 
     Example:
         >>> model = SNPLightningModule(n_snps=10000, num_classes=3)
@@ -89,6 +90,7 @@ class SNPLightningModule(pl.LightningModule):
         focal_alpha: float = 0.25,
         focal_gamma: float = 2.0,
         scheduler_type: str = 'cosine',
+        mu: float = 0.0,
         **model_kwargs
     ):
         super().__init__()
@@ -109,25 +111,64 @@ class SNPLightningModule(pl.LightningModule):
         else:
             self.criterion = nn.CrossEntropyLoss()
 
+        # FedProx: Store global model weights for proximal term
+        self.global_model_state: Optional[Dict[str, torch.Tensor]] = None
+
         self.training_step_outputs = []
         self.validation_step_outputs = []
 
     def forward(self, x: torch.Tensor, return_attention: bool = False) -> torch.Tensor:
         return self.model(x, return_attention=return_attention)
 
+    def _compute_proximal_term(self) -> torch.Tensor:
+        """
+        Compute FedProx proximal term: (mu/2) * ||w - w_global||^2
+
+        This term penalizes local model drift from the global model,
+        helping convergence in heterogeneous federated settings.
+
+        Returns:
+            Proximal regularization term (scalar tensor with gradient tracking)
+        """
+        if self.global_model_state is None or self.hparams.mu == 0.0:
+            return torch.tensor(0.0, device=self.device)
+
+        # Initialize as tensor to maintain gradient tracking through the computation
+        prox_term = torch.tensor(0.0, device=self.device)
+        for name, param in self.named_parameters():
+            if name in self.global_model_state:
+                global_param = self.global_model_state[name].to(param.device)
+                # This maintains gradient flow through param
+                prox_term = prox_term + torch.sum((param - global_param) ** 2)
+
+        return (self.hparams.mu / 2.0) * prox_term
+
     def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
         x, y = batch
         logits = self(x)
         loss = self.criterion(logits, y)
 
+        # FedProx: Add proximal term to loss
+        prox_term = self._compute_proximal_term()
+        total_loss = loss + prox_term
+
         preds = torch.argmax(logits, dim=1)
         acc = (preds == y).float().mean()
 
+        # Log metrics
         self.log('train_loss', loss, prog_bar=True, sync_dist=True)
         self.log('train_acc', acc, prog_bar=True, sync_dist=True)
 
-        self.training_step_outputs.append({'loss': loss.detach(), 'acc': acc.detach()})
-        return loss
+        if self.hparams.mu > 0.0:
+            self.log('train_prox_term', prox_term, prog_bar=False, sync_dist=True)
+            self.log('train_total_loss', total_loss, prog_bar=True, sync_dist=True)
+
+        self.training_step_outputs.append({
+            'loss': loss.detach(),
+            'acc': acc.detach(),
+            'prox_term': prox_term.detach() if isinstance(prox_term, torch.Tensor) else torch.tensor(0.0)
+        })
+        return total_loss
 
     def on_train_epoch_end(self):
         if self.training_step_outputs:

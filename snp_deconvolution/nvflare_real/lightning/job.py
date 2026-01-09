@@ -2,32 +2,41 @@
 """
 NVFlare Job Configuration and Submission Script
 
-Creates and manages NVFlare federated learning jobs using FedAvgRecipe.
+Creates and manages NVFlare federated learning jobs with multiple FL strategies.
 Supports both POC (Proof of Concept) simulation and production deployment.
+
+Supported Strategies:
+    - FedAvg: Federated Averaging (default)
+    - FedProx: Federated Proximal (with proximal term)
+    - Scaffold: Stochastic Controlled Averaging
+    - FedOpt: Server-side Adaptive Optimization (FedAdam, FedAdaGrad, FedYogi)
 
 Reference: https://nvflare.readthedocs.io/en/2.7.0/hello-world/hello-lightning/
 
 Usage:
-    # POC Mode - Simulate FL with multiple clients locally
+    # POC Mode - FedAvg (default)
     python job.py --mode poc --num_rounds 10 --num_clients 3
 
+    # POC Mode - FedProx
+    python job.py --mode poc --strategy fedprox --mu 0.01 --num_rounds 10
+
+    # POC Mode - FedOpt with Adam
+    python job.py --mode poc --strategy fedopt --server_optimizer adam --server_lr 0.01
+
     # Export Mode - Create job package for deployment
-    python job.py --mode export --export_dir ./jobs --num_rounds 50
+    python job.py --mode export --export_dir ./jobs --num_rounds 50 --strategy fedopt
 
     # Run POC simulation directly
-    python job.py --mode poc --num_rounds 5 --run_now
-
-    # Customize clients
-    python job.py --mode poc --clients site1,site2,site3 --num_rounds 10
+    python job.py --mode poc --num_rounds 5 --run_now --strategy fedprox
 
 Architecture:
-    - Uses FedAvgRecipe for simplified job configuration
+    - Uses strategy registry for flexible FL algorithm selection
     - Automatically configures server and client components
-    - Supports ScatterAndGather workflow (FedAvg algorithm)
+    - Supports FedAvg, FedProx, Scaffold, and FedOpt strategies
     - Compatible with both POC and production environments
 
 Author: Generated for Med_SNP_Deconvolution
-Date: 2026-01-07
+Date: 2026-01-09
 """
 
 import argparse
@@ -47,6 +56,13 @@ logger = logging.getLogger(__name__)
 # Add project root to path
 project_root = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(project_root))
+
+# Import strategy registry
+from snp_deconvolution.nvflare_real.strategies import (
+    create_controller,
+    get_client_script_args,
+    get_strategy_metadata,
+)
 
 
 def parse_args():
@@ -89,6 +105,62 @@ def parse_args():
         type=str,
         default=None,
         help='Comma-separated client names (e.g., "site1,site2,site3"). If not provided, auto-generated.'
+    )
+
+    # Federated learning strategy
+    parser.add_argument(
+        '--strategy',
+        type=str,
+        choices=['fedavg', 'fedprox', 'scaffold', 'fedopt'],
+        default='fedavg',
+        help='Federated learning strategy'
+    )
+
+    # FedProx parameters
+    parser.add_argument(
+        '--mu',
+        type=float,
+        default=0.01,
+        help='FedProx proximal term coefficient (only used with --strategy fedprox)'
+    )
+
+    # FedOpt parameters
+    parser.add_argument(
+        '--server_optimizer',
+        type=str,
+        choices=['adam', 'sgdm', 'adagrad', 'yogi'],
+        default='adam',
+        help='Server-side optimizer for FedOpt (only used with --strategy fedopt)'
+    )
+    parser.add_argument(
+        '--server_lr',
+        type=float,
+        default=0.01,
+        help='Learning rate for server optimizer (only used with --strategy fedopt)'
+    )
+    parser.add_argument(
+        '--beta1',
+        type=float,
+        default=0.9,
+        help='Adam/Yogi beta1 parameter (only used with --strategy fedopt)'
+    )
+    parser.add_argument(
+        '--beta2',
+        type=float,
+        default=0.999,
+        help='Adam/Yogi beta2 parameter (only used with --strategy fedopt)'
+    )
+    parser.add_argument(
+        '--momentum',
+        type=float,
+        default=0.9,
+        help='SGDM momentum parameter (only used with --strategy fedopt --server_optimizer sgdm)'
+    )
+    parser.add_argument(
+        '--epsilon',
+        type=float,
+        default=1e-8,
+        help='Numerical stability epsilon (only used with --strategy fedopt)'
     )
 
     # Client configuration
@@ -186,9 +258,17 @@ def create_job_with_recipe(
     feature_type: str,
     data_dir: str,
     min_clients: Optional[int] = None,
+    strategy: str = 'fedavg',
+    mu: float = 0.01,
+    server_optimizer: str = 'adam',
+    server_lr: float = 0.01,
+    beta1: float = 0.9,
+    beta2: float = 0.999,
+    momentum: float = 0.9,
+    epsilon: float = 1e-8,
 ):
     """
-    Create NVFlare job using FedAvgRecipe.
+    Create NVFlare job with specified federated learning strategy.
 
     Args:
         job_name: Name of the job
@@ -202,6 +282,14 @@ def create_job_with_recipe(
         feature_type: Feature type
         data_dir: Data directory
         min_clients: Minimum clients per round
+        strategy: FL strategy ('fedavg', 'fedprox', 'scaffold', 'fedopt')
+        mu: FedProx proximal term coefficient
+        server_optimizer: FedOpt server optimizer ('adam', 'sgdm', 'adagrad', 'yogi')
+        server_lr: FedOpt server learning rate
+        beta1: Adam/Yogi beta1 parameter
+        beta2: Adam/Yogi beta2 parameter
+        momentum: SGDM momentum parameter
+        epsilon: Numerical stability epsilon
 
     Returns:
         FedJob instance
@@ -209,20 +297,35 @@ def create_job_with_recipe(
     try:
         # NVFlare 2.7+ API
         from nvflare.job_config.api import FedJob
-        from nvflare.app_common.workflows.fedavg import FedAvg
         from nvflare.job_config.script_runner import ScriptRunner
     except ImportError:
         logger.error("NVFlare not installed. Install with: pip install nvflare")
         raise
 
+    # Get strategy metadata
+    strategy_metadata = get_strategy_metadata(strategy)
+
     logger.info("="*60)
     logger.info(f"Creating NVFlare job: {job_name}")
     logger.info("="*60)
-    logger.info(f"Algorithm: FedAvg (Federated Averaging)")
+    logger.info(f"Strategy: {strategy_metadata.display_name} ({strategy})")
+    logger.info(f"Description: {strategy_metadata.description}")
     logger.info(f"Clients: {', '.join(clients)}")
     logger.info(f"FL Rounds: {num_rounds}")
     logger.info(f"Local Epochs: {local_epochs}")
     logger.info(f"Min Clients: {min_clients if min_clients else 'all'}")
+
+    # Log strategy-specific parameters
+    if strategy == 'fedprox':
+        logger.info(f"FedProx mu: {mu}")
+    elif strategy == 'fedopt':
+        logger.info(f"Server Optimizer: {server_optimizer}")
+        logger.info(f"Server LR: {server_lr}")
+        if server_optimizer in ['adam', 'yogi']:
+            logger.info(f"Beta1: {beta1}, Beta2: {beta2}")
+        elif server_optimizer == 'sgdm':
+            logger.info(f"Momentum: {momentum}")
+
     logger.info("="*60)
 
     # Create FedJob (NVFlare 2.7+ API)
@@ -231,19 +334,27 @@ def create_job_with_recipe(
         min_clients=min_clients if min_clients else len(clients),
     )
 
-    # Add FedAvg controller to server
-    controller = FedAvg(
+    # Create controller using strategy registry
+    controller = create_controller(
+        strategy=strategy,
         num_clients=len(clients),
         num_rounds=num_rounds,
+        mu=mu,
+        server_optimizer=server_optimizer,
+        server_lr=server_lr,
+        beta1=beta1,
+        beta2=beta2,
+        momentum=momentum,
+        epsilon=epsilon,
     )
     job.to_server(controller)
-    logger.info("Added FedAvg controller to server")
+    logger.info(f"Added {strategy_metadata.display_name} controller to server")
 
     # Configure client script and arguments
     client_script = str(Path(__file__).parent / "client.py")
 
-    # Build client script arguments
-    script_args = (
+    # Build base client script arguments
+    base_args = (
         f"--data_dir {data_dir} "
         f"--feature_type {feature_type} "
         f"--architecture {architecture} "
@@ -254,6 +365,18 @@ def create_job_with_recipe(
         f"--use_focal_loss "
         f"--precision bf16-mixed"
     )
+
+    # Add strategy-specific arguments for client
+    strategy_args = get_client_script_args(
+        strategy=strategy,
+        mu=mu,
+        server_optimizer=server_optimizer,
+        server_lr=server_lr,
+    )
+
+    # Combine all arguments
+    script_args = f"{base_args} {strategy_args}"
+    logger.info(f"Client script arguments: {script_args}")
 
     # Add ScriptRunner to all clients (don't specify individual clients)
     # This allows simulator_run to use n_clients parameter
@@ -304,6 +427,14 @@ def run_poc_mode(args):
         feature_type=args.feature_type,
         data_dir=args.data_dir,
         min_clients=args.min_clients,
+        strategy=args.strategy,
+        mu=args.mu,
+        server_optimizer=args.server_optimizer,
+        server_lr=args.server_lr,
+        beta1=args.beta1,
+        beta2=args.beta2,
+        momentum=args.momentum,
+        epsilon=args.epsilon,
     )
 
     # Verify data exists for each client
@@ -398,6 +529,14 @@ def run_export_mode(args):
         feature_type=args.feature_type,
         data_dir=args.data_dir,
         min_clients=args.min_clients,
+        strategy=args.strategy,
+        mu=args.mu,
+        server_optimizer=args.server_optimizer,
+        server_lr=args.server_lr,
+        beta1=args.beta1,
+        beta2=args.beta2,
+        momentum=args.momentum,
+        epsilon=args.epsilon,
     )
 
     # Export job
