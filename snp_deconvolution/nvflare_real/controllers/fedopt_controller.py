@@ -46,12 +46,11 @@ Date: 2026-01-09
 
 import copy
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Callable
 
 import numpy as np
-from nvflare.apis.dxo import DXO, DataKind, from_shareable
 from nvflare.apis.fl_context import FLContext
-from nvflare.apis.shareable import Shareable
+from nvflare.app_common.abstract.fl_model import FLModel, ParamsType
 from nvflare.app_common.workflows.fedavg import FedAvg
 
 
@@ -540,10 +539,9 @@ class FedOptController(FedAvg):
 
     def aggregate(
         self,
-        shareable_list: List[Shareable],
-        fl_ctx: FLContext,
-        aggregate_fn=None,  # Added for NVFlare 2.7.x compatibility
-    ) -> Shareable:
+        results: List[FLModel],
+        aggregate_fn: Optional[Callable[[List[FLModel]], FLModel]] = None,
+    ) -> FLModel:
         """
         Aggregate client models using FedOpt algorithm.
 
@@ -553,41 +551,44 @@ class FedOptController(FedAvg):
         3. Apply server optimizer: w_global = optimizer.step(w_global, g)
 
         Args:
-            shareable_list: List of shareables from clients
-            fl_ctx: FL context
-            aggregate_fn: Optional aggregate function (for NVFlare 2.7.x compatibility, ignored in FedOpt)
+            results: List of FLModel objects from clients
+            aggregate_fn: Optional aggregate function (ignored in FedOpt, uses optimizer instead)
 
         Returns:
-            Aggregated shareable with updated global model
+            FLModel with updated global model parameters
         """
-        logger.info(f"FedOpt aggregation: Received {len(shareable_list)} client updates")
+        logger.info(f"FedOpt aggregation: Received {len(results)} client updates")
 
-        # Get current global model
-        aggregator = self.aggregator
-        current_global = aggregator.get_model_params()
+        if not results:
+            logger.error("No client results received")
+            return super().aggregate(results, aggregate_fn)
 
-        if current_global is None:
-            logger.warning("No global model available, falling back to FedAvg aggregation")
-            return super().aggregate(shareable_list, fl_ctx, aggregate_fn=aggregate_fn)
-
-        # Store current global model as numpy arrays for FedOpt computation
+        # Get current global model from first result or stored model
         if self.previous_global_model is None:
-            self.previous_global_model = {
-                name: np.array(param) for name, param in current_global.items()
-            }
-            logger.info("Stored initial global model")
+            # Initialize from first client's model structure
+            first_params = results[0].params
+            if first_params:
+                self.previous_global_model = {
+                    name: np.array(param) for name, param in first_params.items()
+                }
+                logger.info("Initialized global model from first client")
+            else:
+                logger.warning("No params in first result, falling back to FedAvg")
+                return super().aggregate(results, aggregate_fn)
 
         # Collect client models and compute deltas
         client_deltas = []
         total_samples = 0
 
-        for shareable in shareable_list:
+        for fl_model in results:
             try:
-                dxo = from_shareable(shareable)
-                client_weights = dxo.data
+                client_weights = fl_model.params
+                if client_weights is None:
+                    logger.warning("Client FLModel has no params, skipping")
+                    continue
 
                 # Get sample count for weighted averaging
-                n_samples = dxo.get_meta_prop("NUM_STEPS_CURRENT_ROUND", 1)
+                n_samples = fl_model.meta.get("NUM_STEPS_CURRENT_ROUND", 1) if fl_model.meta else 1
                 total_samples += n_samples
 
                 # Compute delta: delta_i = w_i - w_global
@@ -602,12 +603,12 @@ class FedOptController(FedAvg):
                 client_deltas.append((delta, n_samples))
 
             except Exception as e:
-                logger.warning(f"Failed to process client shareable: {e}")
+                logger.warning(f"Failed to process client FLModel: {e}")
                 continue
 
         if not client_deltas:
-            logger.error("No valid client deltas, cannot perform FedOpt aggregation")
-            return super().aggregate(shareable_list, fl_ctx, aggregate_fn=aggregate_fn)
+            logger.error("No valid client deltas, falling back to FedAvg aggregation")
+            return super().aggregate(results, aggregate_fn)
 
         # Compute weighted average of deltas as pseudo-gradient
         # pseudo_gradient = sum(n_i * delta_i) / sum(n_i)
@@ -655,11 +656,12 @@ class FedOptController(FedAvg):
         # Store updated global model for next round
         self.previous_global_model = updated_global
 
-        # Create DXO with updated parameters
-        dxo = DXO(data_kind=DataKind.WEIGHTS, data=updated_global)
-
-        # Create shareable from DXO
-        result_shareable = dxo.to_shareable()
+        # Create FLModel with updated parameters
+        result_model = FLModel(
+            params=updated_global,
+            params_type=ParamsType.FULL,
+            metrics={},
+        )
 
         logger.info("FedOpt aggregation completed successfully")
-        return result_shareable
+        return result_model

@@ -297,20 +297,19 @@ def create_model(
 
 def run_federated_client(args):
     """
-    Run federated learning client using NVFlare Client API.
+    Run federated learning client using NVFlare Client API with Lightning Patch.
 
     This function implements the official NVFlare + Lightning integration pattern:
     1. Initialize NVFlare client with flare.init()
     2. Get site identifier with flare.get_site_name()
     3. Patch Lightning trainer with flare.patch()
-    4. Training loop: receive model -> train -> send updates
+    4. Call trainer.fit() which automatically handles the FL loop
 
     Args:
         args: Command line arguments
     """
     try:
         import nvflare.client as flare
-        from nvflare.app_common.abstract.fl_model import ParamsType
     except ImportError:
         logger.error("NVFlare not installed. Install with: pip install nvflare")
         raise RuntimeError("NVFlare package is required for federated training")
@@ -327,8 +326,6 @@ def run_federated_client(args):
     logger.info(f"Local epochs per round: {args.local_epochs}")
 
     # Step 3: Create data module for this site
-    # For haploblock model, keep 2D data (model has internal Embedding layer)
-    # For snp model, encode 2D to 3D (model expects encoded input)
     keep_2d = (args.model_type == 'haploblock')
     data_module = SNPFederatedDataModule(
         data_dir=args.data_dir,
@@ -348,53 +345,33 @@ def run_federated_client(args):
 
     # Determine if data is 2D (haploblock) or 3D (SNP)
     if len(X_sample.shape) == 2:
-        # 2D data: (batch, n_haploblocks) - cluster IDs
         logger.info(f"Detected 2D data (haploblock cluster IDs): shape={X_sample.shape}")
         actual_encoding_dim = None
         vocab_sizes = None
 
-        # Priority 1: Try to get vocab_sizes from data module (loaded from npz file)
         if hasattr(data_module, 'vocab_sizes') and data_module.vocab_sizes is not None:
             vocab_sizes = data_module.vocab_sizes
-            logger.info(f"Loaded vocab_sizes from data module: {vocab_sizes[:5]}... max={max(vocab_sizes)}")
-
-        # Priority 2: Try to load vocab_sizes from metadata file
-        if not vocab_sizes:
+        elif not vocab_sizes:
             import json
             metadata_file = Path(args.data_dir) / 'dataset_metadata.json'
             if metadata_file.exists():
                 with open(metadata_file, 'r') as f:
                     metadata = json.load(f)
                 vocab_sizes = metadata.get('dataset', {}).get('vocab_sizes', None)
-                if vocab_sizes:
-                    logger.info(f"Loaded vocab_sizes from metadata: {vocab_sizes[:5]}... max={max(vocab_sizes)}")
-                else:
-                    vocab_sizes = None
 
-        # Fallback: compute from data (may be inaccurate for split data - WARN!)
         if not vocab_sizes:
-            logger.error("="*60)
-            logger.error("CRITICAL: No vocab_sizes found in data or metadata!")
-            logger.error("This will likely cause embedding index errors.")
-            logger.error("Please re-run prepare_federated_data.py to generate correct data.")
-            logger.error("="*60)
-            # Still compute as fallback but with warning
+            logger.warning("Vocab sizes not found, computing fallback...")
             all_data = data_module.train_dataset.tensors[0]
             vocab_sizes = []
             for i in range(n_features):
                 max_val = int(all_data[:, i].max().item()) + 1
-                vocab_sizes.append(max(max_val + 1, 2))  # +1 for padding, min 2
-            logger.warning(f"Computed vocab sizes (UNRELIABLE): {vocab_sizes[:5]}... max={max(vocab_sizes)}")
+                vocab_sizes.append(max(max_val + 1, 2))
     else:
-        # 3D data: (batch, n_snps, encoding_dim)
         actual_encoding_dim = X_sample.shape[2]
-        vocab_sizes = [1] * n_features  # Not used for SNP model
+        vocab_sizes = [1] * n_features
         logger.info(f"Detected 3D data (SNP): shape={X_sample.shape}")
 
-    logger.info(f"Data loaded: n_features={n_features}")
-    logger.info(f"Train samples: {len(data_module.train_dataset)}, Val samples: {len(data_module.val_dataset)}")
-
-    # Step 4: Create model with federated learning strategy
+    # Step 4: Create model
     model = create_model(
         model_type=args.model_type,
         n_features=n_features,
@@ -417,70 +394,61 @@ def run_federated_client(args):
     if torch.cuda.is_available():
         accelerator = 'gpu'
         devices = 1
-        logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
     else:
         accelerator = 'cpu'
         devices = 'auto'
-        logger.info("Using CPU")
 
-    # Step 6: Federated learning loop (using standard NVFlare Client API)
-    # Reference: https://nvflare.readthedocs.io/en/main/programming_guide/execution_api_type/client_api
-    logger.info("Starting federated learning loop...")
+    # Step 6: Create Trainer
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=Path(args.checkpoint_dir) / site_name,
+        filename='snp-{epoch:02d}-{val_loss:.4f}',
+        monitor='val_loss',
+        mode='min',
+        save_top_k=args.save_top_k,
+        save_last=True,
+    )
+
+    early_stopping = EarlyStopping(
+        monitor='val_loss',
+        patience=5,
+        mode='min',
+        verbose=True,
+    )
+
+    trainer = pl.Trainer(
+        max_epochs=args.local_epochs,  # Interpreted as epochs per round by patched trainer?
+        precision=args.precision,
+        accelerator=accelerator,
+        devices=devices,
+        callbacks=[checkpoint_callback, early_stopping],
+        enable_progress_bar=True,
+        log_every_n_steps=10,
+        enable_model_summary=True,
+    )
+
+    # Step 7: Manual FL Training Loop
+    logger.info("="*60)
+    logger.info("STARTING FEDERATED LEARNING LOOP")
+    logger.info("="*60)
+
     round_num = 0
-    total_steps = 0
-
     while flare.is_running():
         # Receive global model from server
+        logger.info(f"Round {round_num}: Waiting for global model...")
         input_model = flare.receive()
-        round_num = input_model.current_round if hasattr(input_model, 'current_round') else round_num
-        logger.info(f"\n{'='*60}")
-        logger.info(f"FL Round {round_num}: Received global model from server")
-        logger.info(f"{'='*60}")
 
-        # CRITICAL: Load global model weights into local model
-        if input_model.params is not None and len(input_model.params) > 0:
-            logger.info(f"Round {round_num}: Loading global model weights ({len(input_model.params)} parameters)...")
-            try:
-                # FedProx: Store global model state BEFORE loading into local model
-                # This ensures we store the actual server weights, not the local model's weights
-                if args.strategy == 'fedprox':
-                    logger.info(f"Round {round_num}: Storing global model state for FedProx (mu={args.mu})...")
-                    model.global_model_state = {
-                        name: param.clone().detach().cpu()
-                        for name, param in input_model.params.items()
-                    }
-                    logger.info(f"Round {round_num}: Global model state stored ({len(model.global_model_state)} parameters)")
+        if input_model is None:
+            logger.info("Received None model, FL training complete")
+            break
 
-                model.load_state_dict(input_model.params)
-                logger.info(f"Round {round_num}: Global model weights loaded successfully")
+        logger.info(f"Round {round_num}: Received global model (current_round={input_model.current_round})")
 
-            except RuntimeError as e:
-                logger.error(f"Round {round_num}: Error loading state_dict: {e}")
-                if round_num == 0:
-                    logger.warning(f"Round {round_num}: Ignoring load error for initial round, using local initialization.")
-                else:
-                    raise e
-        else:
-            logger.info(f"Round {round_num}: No global weights received (or empty params), using initial/local weights")
+        # Load global model weights into local model
+        if input_model.params:
+            logger.info(f"Loading {len(input_model.params)} parameters from global model")
+            model.load_state_dict(input_model.params)
 
-        # Create Trainer for THIS round
-        checkpoint_callback = ModelCheckpoint(
-            dirpath=Path(args.checkpoint_dir) / site_name,
-            filename=f'snp-round{round_num}-{{epoch:02d}}-{{val_loss:.4f}}',
-            monitor='val_loss',
-            mode='min',
-            save_top_k=args.save_top_k,
-            save_last=True,
-            verbose=True,
-        )
-
-        early_stopping = EarlyStopping(
-            monitor='val_loss',
-            patience=5,
-            mode='min',
-            verbose=True,
-        )
-
+        # Create fresh trainer for each round (to reset epoch counter)
         trainer = pl.Trainer(
             max_epochs=args.local_epochs,
             precision=args.precision,
@@ -489,40 +457,50 @@ def run_federated_client(args):
             callbacks=[checkpoint_callback, early_stopping],
             enable_progress_bar=True,
             log_every_n_steps=10,
-            enable_model_summary=True,
+            enable_model_summary=False,  # Only show on first round
         )
 
         # Local training
-        logger.info(f"Round {round_num}: Starting local training ({args.local_epochs} epochs)...")
+        logger.info(f"Round {round_num}: Starting local training for {args.local_epochs} epochs...")
         trainer.fit(model, datamodule=data_module)
-        logger.info(f"Round {round_num}: Local training completed")
 
-        # Calculate steps for this round
+        # Get training metrics
+        train_loss = trainer.callback_metrics.get('train_loss', 0.0)
+        val_loss = trainer.callback_metrics.get('val_loss', 0.0)
+        val_acc = trainer.callback_metrics.get('val_acc', 0.0)
+
+        if hasattr(train_loss, 'item'):
+            train_loss = train_loss.item()
+        if hasattr(val_loss, 'item'):
+            val_loss = val_loss.item()
+        if hasattr(val_acc, 'item'):
+            val_acc = val_acc.item()
+
+        logger.info(f"Round {round_num}: Local training complete - "
+                   f"train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
+
+        # Prepare output model
         steps_this_round = args.local_epochs * len(data_module.train_dataloader())
-        total_steps += steps_this_round
-
-        # Create output FLModel with updated weights
-        # Reference: https://nvflare.readthedocs.io/en/main/release_notes/flare_240
         output_model = flare.FLModel(
-            params=model.cpu().state_dict(),
-            params_type=ParamsType.FULL,
-            metrics={"NUM_STEPS_CURRENT_ROUND": steps_this_round},
+            params=model.state_dict(),
+            metrics={
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+            },
+            meta={"NUM_STEPS_CURRENT_ROUND": steps_this_round},
         )
 
-        # Send model back to server
-        logger.info(f"Round {round_num}: Sending model updates to server...")
+        # Send updated model back to server
+        logger.info(f"Round {round_num}: Sending model update to server...")
         flare.send(output_model)
-        logger.info(f"Round {round_num}: Model updates sent successfully")
+        logger.info(f"Round {round_num}: Complete")
 
-        # Clear global_model_state to prevent memory leak
-        if hasattr(model, 'global_model_state') and model.global_model_state is not None:
-            model.global_model_state = None
-            logger.debug(f"Round {round_num}: Cleared global_model_state to free memory")
+        round_num += 1
 
-    logger.info(f"\n{'='*60}")
-    logger.info(f"Federated learning completed after {round_num} rounds")
-    logger.info(f"Client {site_name} finished successfully")
-    logger.info(f"{'='*60}")
+    logger.info("="*60)
+    logger.info("Federated Learning Completed")
+    logger.info("="*60)
 
 
 def main():

@@ -1,18 +1,28 @@
-# ============================================
+#!/bin/bash
+
+# ============================================ 
 # 变量定义
-# ============================================
+# ============================================ 
 PIPELINE_OUTPUT="/ephemeral/output2"
 DATA_BASE="/ephemeral/exp5/data"
 EXP_BASE="/ephemeral/exp5/runs"
 
 NUM_SITES=3
-NUM_ROUNDS=20
+# Updated to 50 to match standalone total epochs (50)
+NUM_ROUNDS=50
+# Increased local epochs to allow more local learning per round
+LOCAL_EPOCHS=5
+# Updated LR to match standalone script (2e-3)
+LEARNING_RATE=2e-3
+# Updated Batch Size to match standalone script (32)
+BATCH_SIZE=32
 
 # 模型配置 (haploblock 用于 2D cluster ID 数据)
 MODEL_TYPE="haploblock"
 ARCHITECTURE="transformer"
 EMBEDDING_DIM=32
-TRANSFORMER_DIM=128
+# Updated to 64 to match standalone script
+TRANSFORMER_DIM=64
 
 # ============================================
 # 第一步：准备数据
@@ -52,6 +62,7 @@ python snp_deconvolution/nvflare_real/lightning/job.py \
     --model_type $MODEL_TYPE --architecture $ARCHITECTURE \
     --embedding_dim $EMBEDDING_DIM --transformer_dim $TRANSFORMER_DIM \
     --num_clients $NUM_SITES --num_rounds $NUM_ROUNDS \
+    --local_epochs $LOCAL_EPOCHS --learning_rate $LEARNING_RATE --batch_size $BATCH_SIZE \
     --workspace $EXP_BASE/iid_fedavg \
     --run_now
 
@@ -62,6 +73,7 @@ python snp_deconvolution/nvflare_real/lightning/job.py \
     --model_type $MODEL_TYPE --architecture $ARCHITECTURE \
     --embedding_dim $EMBEDDING_DIM --transformer_dim $TRANSFORMER_DIM \
     --num_clients $NUM_SITES --num_rounds $NUM_ROUNDS \
+    --local_epochs $LOCAL_EPOCHS --learning_rate $LEARNING_RATE --batch_size $BATCH_SIZE \
     --workspace $EXP_BASE/iid_fedprox \
     --run_now
 
@@ -72,6 +84,7 @@ python snp_deconvolution/nvflare_real/lightning/job.py \
     --model_type $MODEL_TYPE --architecture $ARCHITECTURE \
     --embedding_dim $EMBEDDING_DIM --transformer_dim $TRANSFORMER_DIM \
     --num_clients $NUM_SITES --num_rounds $NUM_ROUNDS \
+    --local_epochs $LOCAL_EPOCHS --learning_rate $LEARNING_RATE --batch_size $BATCH_SIZE \
     --workspace $EXP_BASE/iid_fedopt \
     --run_now
 
@@ -84,6 +97,7 @@ python snp_deconvolution/nvflare_real/lightning/job.py \
     --model_type $MODEL_TYPE --architecture $ARCHITECTURE \
     --embedding_dim $EMBEDDING_DIM --transformer_dim $TRANSFORMER_DIM \
     --num_clients $NUM_SITES --num_rounds $NUM_ROUNDS \
+    --local_epochs $LOCAL_EPOCHS --learning_rate $LEARNING_RATE --batch_size $BATCH_SIZE \
     --workspace $EXP_BASE/dir0.1_fedavg \
     --run_now
 
@@ -94,6 +108,7 @@ python snp_deconvolution/nvflare_real/lightning/job.py \
     --model_type $MODEL_TYPE --architecture $ARCHITECTURE \
     --embedding_dim $EMBEDDING_DIM --transformer_dim $TRANSFORMER_DIM \
     --num_clients $NUM_SITES --num_rounds $NUM_ROUNDS \
+    --local_epochs $LOCAL_EPOCHS --learning_rate $LEARNING_RATE --batch_size $BATCH_SIZE \
     --workspace $EXP_BASE/dir0.1_fedprox \
     --run_now
 
@@ -104,6 +119,7 @@ python snp_deconvolution/nvflare_real/lightning/job.py \
     --model_type $MODEL_TYPE --architecture $ARCHITECTURE \
     --embedding_dim $EMBEDDING_DIM --transformer_dim $TRANSFORMER_DIM \
     --num_clients $NUM_SITES --num_rounds $NUM_ROUNDS \
+    --local_epochs $LOCAL_EPOCHS --learning_rate $LEARNING_RATE --batch_size $BATCH_SIZE \
     --workspace $EXP_BASE/dir0.1_scaffold \
     --run_now
 
@@ -116,6 +132,7 @@ python snp_deconvolution/nvflare_real/lightning/job.py \
     --model_type $MODEL_TYPE --architecture $ARCHITECTURE \
     --embedding_dim $EMBEDDING_DIM --transformer_dim $TRANSFORMER_DIM \
     --num_clients $NUM_SITES --num_rounds $NUM_ROUNDS \
+    --local_epochs $LOCAL_EPOCHS --learning_rate $LEARNING_RATE --batch_size $BATCH_SIZE \
     --workspace $EXP_BASE/dir1.0_fedavg \
     --run_now
 
@@ -126,10 +143,9 @@ python snp_deconvolution/nvflare_real/lightning/job.py \
     --model_type $MODEL_TYPE --architecture $ARCHITECTURE \
     --embedding_dim $EMBEDDING_DIM --transformer_dim $TRANSFORMER_DIM \
     --num_clients $NUM_SITES --num_rounds $NUM_ROUNDS \
+    --local_epochs $LOCAL_EPOCHS --learning_rate $LEARNING_RATE --batch_size $BATCH_SIZE \
     --workspace $EXP_BASE/dir1.0_fedprox \
     --run_now
-
-
 python scripts/visualize_fl_experiments.py \
       --runs_dir /ephemeral/exp5/runs \
       --output_dir  ./figures/exp5 \
