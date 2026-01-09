@@ -19,3 +19,4 @@ data/Halldorsson2019/*
 !data/haploblock_boundaries_chr6_heightGenes.tsv
 
 out*
+tmp/

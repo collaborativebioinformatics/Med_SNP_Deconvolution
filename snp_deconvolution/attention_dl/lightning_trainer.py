@@ -30,6 +30,7 @@ import sys
 # Add project root to path
 sys.path.insert(0, '/Users/saltfish/Files/Coding/Haploblock_Clusters_ElixirBH25')
 from dl_models.snp_interpretable_models import InterpretableSNPModel
+from dl_models.haploblock_embedding_model import HaploblockTransformer, HaploblockCNNTransformer
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +259,192 @@ class SNPLightningModule(pl.LightningModule):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Identify top causal SNPs."""
         return self.model.identify_causal_snps(x, top_k=top_k, method=method)
+
+
+class HaploblockLightningModule(pl.LightningModule):
+    """
+    PyTorch Lightning module for Haploblock classification.
+
+    Uses HaploblockTransformer with embedding layer for cluster ID inputs.
+    Input: (batch, n_haploblocks) - 2D cluster IDs
+    Output: (batch, num_classes) - classification logits
+
+    Args:
+        n_haploblocks: Number of haploblocks
+        vocab_sizes: List of vocabulary sizes per haploblock (max cluster ID + 1)
+        embedding_dim: Embedding dimension (default: 32)
+        transformer_dim: Transformer hidden dimension (default: 128)
+        num_layers: Number of transformer layers (default: 4)
+        num_heads: Number of attention heads (default: 8)
+        num_classes: Number of output classes (default: 3)
+        architecture: 'transformer' or 'cnn_transformer' (default: 'transformer')
+        learning_rate: Initial learning rate
+        weight_decay: L2 regularization
+        use_focal_loss: Use focal loss for class imbalance
+        mu: FedProx proximal coefficient (default: 0.0 for FedAvg)
+    """
+
+    def __init__(
+        self,
+        n_haploblocks: int,
+        vocab_sizes: List[int],
+        embedding_dim: int = 32,
+        transformer_dim: int = 128,
+        num_layers: int = 4,
+        num_heads: int = 8,
+        num_classes: int = 3,
+        architecture: str = 'transformer',
+        learning_rate: float = 1e-4,
+        weight_decay: float = 1e-5,
+        use_focal_loss: bool = True,
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0,
+        scheduler_type: str = 'cosine',
+        mu: float = 0.0,
+        dropout: float = 0.2,
+        **model_kwargs
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        # Create model based on architecture
+        if architecture == 'cnn_transformer':
+            self.model = HaploblockCNNTransformer(
+                n_haploblocks=n_haploblocks,
+                vocab_sizes=vocab_sizes,
+                embedding_dim=embedding_dim,
+                transformer_dim=transformer_dim,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                num_classes=num_classes,
+                dropout=dropout,
+                **model_kwargs
+            )
+        else:  # 'transformer'
+            self.model = HaploblockTransformer(
+                n_haploblocks=n_haploblocks,
+                vocab_sizes=vocab_sizes,
+                embedding_dim=embedding_dim,
+                transformer_dim=transformer_dim,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                num_classes=num_classes,
+                dropout=dropout,
+                **model_kwargs
+            )
+
+        # Loss function
+        if use_focal_loss:
+            self.criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        else:
+            self.criterion = nn.CrossEntropyLoss()
+
+        # FedProx: Store global model weights for proximal term
+        self.global_model_state: Optional[Dict[str, torch.Tensor]] = None
+
+        self.training_step_outputs = []
+        self.validation_step_outputs = []
+
+    def forward(self, x: torch.Tensor, return_attention: bool = False) -> torch.Tensor:
+        return self.model(x, return_attention=return_attention)
+
+    def _compute_proximal_term(self) -> torch.Tensor:
+        """Compute FedProx proximal regularization term."""
+        if self.global_model_state is None or self.hparams.mu == 0.0:
+            return torch.tensor(0.0, device=self.device)
+
+        prox_term = torch.tensor(0.0, device=self.device)
+        for name, param in self.model.named_parameters():
+            if name in self.global_model_state:
+                global_param = self.global_model_state[name].to(self.device)
+                prox_term = prox_term + torch.sum((param - global_param) ** 2)
+
+        return (self.hparams.mu / 2.0) * prox_term
+
+    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        x, y = batch
+        x = x.long()  # Ensure cluster IDs are long type for embedding
+        logits = self.model(x)
+        loss = self.criterion(logits, y)
+
+        # FedProx proximal term
+        prox_term = self._compute_proximal_term()
+        total_loss = loss + prox_term
+
+        # Metrics
+        preds = logits.argmax(dim=1)
+        acc = (preds == y).float().mean()
+
+        self.log('train_loss', loss, prog_bar=True, sync_dist=True)
+        self.log('train_acc', acc, prog_bar=True, sync_dist=True)
+
+        if self.hparams.mu > 0.0:
+            self.log('train_prox_term', prox_term, prog_bar=False, sync_dist=True)
+
+        return total_loss
+
+    def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
+        x, y = batch
+        x = x.long()
+        logits = self.model(x)
+        loss = self.criterion(logits, y)
+
+        preds = logits.argmax(dim=1)
+        acc = (preds == y).float().mean()
+
+        self.log('val_loss', loss, prog_bar=True, sync_dist=True)
+        self.log('val_acc', acc, prog_bar=True, sync_dist=True)
+
+        return {'val_loss': loss, 'val_acc': acc}
+
+    def test_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> Dict[str, torch.Tensor]:
+        x, y = batch
+        x = x.long()
+        logits = self.model(x)
+        loss = self.criterion(logits, y)
+
+        preds = logits.argmax(dim=1)
+        acc = (preds == y).float().mean()
+
+        self.log('test_loss', loss, sync_dist=True)
+        self.log('test_acc', acc, sync_dist=True)
+
+        return {'test_loss': loss, 'test_acc': acc, 'preds': preds, 'labels': y}
+
+    def configure_optimizers(self) -> Dict:
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.hparams.learning_rate,
+            weight_decay=self.hparams.weight_decay
+        )
+
+        if self.hparams.scheduler_type == 'cosine':
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, T_0=10, T_mult=2, eta_min=1e-7
+            )
+            return {
+                'optimizer': optimizer,
+                'lr_scheduler': {'scheduler': scheduler, 'interval': 'epoch'}
+            }
+        elif self.hparams.scheduler_type == 'plateau':
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-7
+            )
+            return {
+                'optimizer': optimizer,
+                'lr_scheduler': {'scheduler': scheduler, 'monitor': 'val_loss'}
+            }
+        return {'optimizer': optimizer}
+
+    def set_global_model(self, global_state: Dict[str, torch.Tensor]):
+        """Set global model state for FedProx."""
+        self.global_model_state = {k: v.clone() for k, v in global_state.items()}
+
+    def get_haploblock_importance(self) -> torch.Tensor:
+        """Get haploblock importance from attention weights."""
+        if hasattr(self.model, 'attention_weights') and self.model.attention_weights is not None:
+            return self.model.attention_weights
+        raise ValueError("Run forward pass first to get attention weights")
 
 
 def create_lightning_trainer(

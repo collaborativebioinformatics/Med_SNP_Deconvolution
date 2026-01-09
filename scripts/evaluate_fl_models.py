@@ -85,43 +85,32 @@ def find_best_checkpoint(site_dir: Path) -> Optional[Path]:
     return best_ckpt
 
 
-def load_model_from_checkpoint(
-    ckpt_path: Path,
-    n_snps: int,
-    num_classes: int,
-    encoding_dim: int = 8,
-    architecture: str = "cnn_transformer"
-) -> nn.Module:
+def load_model_from_checkpoint(ckpt_path: Path) -> Tuple[nn.Module, Dict[str, Any]]:
     """
-    从 checkpoint 加载模型
+    从 checkpoint 加载模型 (使用 Lightning 的 load_from_checkpoint)
+
+    Returns:
+        model: 加载的模型 (InterpretableSNPModel)
+        params: 模型参数
     """
-    # 加载 checkpoint
-    checkpoint = torch.load(ckpt_path, map_location='cpu')
+    # 直接使用 Lightning 加载，自动恢复超参数
+    lightning_module = SNPLightningModule.load_from_checkpoint(ckpt_path, map_location='cpu')
 
-    # 创建模型
-    model = InterpretableSNPModel(
-        n_snps=n_snps,
-        num_classes=num_classes,
-        encoding_dim=encoding_dim,
-        architecture=architecture,
-    )
+    # 获取内部的 InterpretableSNPModel
+    model = lightning_module.model
 
-    # 加载权重
-    if 'state_dict' in checkpoint:
-        # Lightning checkpoint 格式
-        state_dict = checkpoint['state_dict']
-        # 移除 'model.' 前缀
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith('model.'):
-                new_state_dict[k[6:]] = v
-            else:
-                new_state_dict[k] = v
-        model.load_state_dict(new_state_dict, strict=False)
-    else:
-        model.load_state_dict(checkpoint, strict=False)
+    # 从 hparams 获取参数
+    hparams = lightning_module.hparams
+    params = {
+        'n_snps': hparams.get('n_snps'),
+        'encoding_dim': hparams.get('encoding_dim', 8),
+        'num_classes': hparams.get('num_classes', 2),
+        'architecture': hparams.get('architecture', 'cnn_transformer'),
+    }
 
-    return model
+    logger.info(f"  模型参数: n_snps={params['n_snps']}, encoding_dim={params['encoding_dim']}, num_classes={params['num_classes']}")
+
+    return model, params
 
 
 def load_test_data(data_dir: Path, feature_type: str = "cluster") -> Tuple[torch.Tensor, torch.Tensor]:
@@ -343,20 +332,14 @@ def evaluate_experiment(
         logger.error(f"无法加载测试数据: {e}")
         return results
 
-    # 推断模型参数
-    if len(X_test.shape) == 3:
-        n_snps = X_test.shape[1]
-        encoding_dim = X_test.shape[2]
-    else:
-        n_snps = X_test.shape[1]
-        encoding_dim = 8
-
-    num_classes = len(torch.unique(y_test))
-    logger.info(f"模型参数: n_snps={n_snps}, num_classes={num_classes}, encoding_dim={encoding_dim}")
+    # 记录测试数据信息
+    data_num_classes = len(torch.unique(y_test))
+    logger.info(f"测试数据: shape={X_test.shape}, num_classes={data_num_classes}")
 
     # 加载各站点模型
     models = []
     site_sample_counts = []
+    model_params = None  # 从第一个成功加载的模型获取参数
 
     for site_id in range(1, num_sites + 1):
         site_name = f"site-{site_id}"
@@ -374,9 +357,28 @@ def evaluate_experiment(
         logger.info(f"加载 {site_name} checkpoint: {ckpt_path.name}")
 
         try:
-            model = load_model_from_checkpoint(
-                ckpt_path, n_snps, num_classes, encoding_dim, architecture
-            )
+            model, params = load_model_from_checkpoint(ckpt_path)
+
+            # 保存模型参数 (从第一个成功加载的模型)
+            if model_params is None:
+                model_params = params
+                # 准备测试数据以匹配模型的期望输入
+                expected_encoding_dim = params['encoding_dim']
+                if len(X_test.shape) == 2:
+                    # 2D 数据扩展到 3D
+                    if expected_encoding_dim == 3:
+                        # 假设是 SNP 数据 (0, 1, 2)，使用 one-hot 编码
+                        X_test_int = X_test.long().clamp(0, 2)
+                        X_test = torch.nn.functional.one_hot(X_test_int, num_classes=3).float()
+                        logger.info(f"使用 one-hot 编码扩展测试数据: {X_test.shape}")
+                    else:
+                        # 其他 encoding_dim，使用简单的特征归一化后扩展
+                        X_test = X_test.unsqueeze(-1).repeat(1, 1, expected_encoding_dim)
+                        # 对每个 encoding 维度添加一些变化以提供信息
+                        for i in range(expected_encoding_dim):
+                            X_test[:, :, i] = X_test[:, :, i] * (1 + 0.1 * i)
+                        logger.info(f"扩展测试数据到 3D: {X_test.shape} (encoding_dim={expected_encoding_dim})")
+
             models.append(model)
 
             # 评估单个站点模型
@@ -401,7 +403,9 @@ def evaluate_experiment(
             logger.info(f"  {site_name}: accuracy={site_result['accuracy']:.4f}, f1={site_result['macro_f1']:.4f}")
 
         except Exception as e:
+            import traceback
             logger.error(f"加载模型失败 {site_name}: {e}")
+            logger.debug(traceback.format_exc())
             continue
 
     # 聚合模型并评估
@@ -412,13 +416,16 @@ def evaluate_experiment(
         total_samples = sum(site_sample_counts)
         weights = [c / total_samples for c in site_sample_counts]
 
-        aggregated_model = aggregate_models(models, weights, num_classes)
+        actual_num_classes = model_params.get('num_classes', data_num_classes) if model_params else data_num_classes
+        aggregated_model = aggregate_models(models, weights, actual_num_classes)
         aggregated_result = evaluate_model(aggregated_model, X_test, y_test)
         results['aggregated_result'] = aggregated_result
 
         logger.info(f"  聚合模型: accuracy={aggregated_result['accuracy']:.4f}, f1={aggregated_result['macro_f1']:.4f}")
     elif len(models) == 1:
         results['aggregated_result'] = results['site_results'].get('site-1')
+    else:
+        logger.warning("没有成功加载任何模型，跳过聚合")
 
     # 找出最佳站点
     if results['site_results']:

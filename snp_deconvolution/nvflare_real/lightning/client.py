@@ -40,6 +40,7 @@ sys.path.insert(0, str(project_root))
 
 from snp_deconvolution.attention_dl.lightning_trainer import (
     SNPLightningModule,
+    HaploblockLightningModule,
     FocalLoss,
 )
 from snp_deconvolution.nvflare_real.data.federated_data_module import (
@@ -80,17 +81,36 @@ def parse_args():
 
     # Model arguments
     parser.add_argument(
+        '--model_type',
+        type=str,
+        default='haploblock',
+        choices=['snp', 'haploblock'],
+        help='Model type: snp (3D input) or haploblock (2D cluster IDs)'
+    )
+    parser.add_argument(
         '--architecture',
         type=str,
-        default='cnn_transformer',
-        choices=['cnn', 'cnn_transformer', 'gnn'],
+        default='transformer',
+        choices=['cnn', 'cnn_transformer', 'transformer'],
         help='Model architecture'
     )
     parser.add_argument(
         '--encoding_dim',
         type=int,
         default=8,
-        help='Dimension of genotype encoding'
+        help='Dimension of genotype encoding (for SNP model)'
+    )
+    parser.add_argument(
+        '--embedding_dim',
+        type=int,
+        default=32,
+        help='Embedding dimension (for Haploblock model)'
+    )
+    parser.add_argument(
+        '--transformer_dim',
+        type=int,
+        default=128,
+        help='Transformer hidden dimension'
     )
     parser.add_argument(
         '--num_classes',
@@ -193,8 +213,12 @@ def parse_args():
 
 
 def create_model(
+    model_type: str,
     n_features: int,
+    vocab_sizes: list,
     encoding_dim: int,
+    embedding_dim: int,
+    transformer_dim: int,
     num_classes: int,
     architecture: str,
     learning_rate: float,
@@ -204,13 +228,17 @@ def create_model(
     focal_gamma: float,
     strategy: str = 'fedavg',
     mu: float = 0.0,
-) -> SNPLightningModule:
+) -> pl.LightningModule:
     """
-    Create SNP Lightning model.
+    Create Lightning model based on model type.
 
     Args:
-        n_features: Number of features (SNPs or clusters)
-        encoding_dim: Genotype encoding dimension
+        model_type: 'snp' (3D input) or 'haploblock' (2D cluster IDs)
+        n_features: Number of features (SNPs or haploblocks)
+        vocab_sizes: List of vocabulary sizes per haploblock (for haploblock model)
+        encoding_dim: Genotype encoding dimension (for SNP model)
+        embedding_dim: Embedding dimension (for haploblock model)
+        transformer_dim: Transformer hidden dimension
         num_classes: Number of classes
         architecture: Model architecture
         learning_rate: Learning rate
@@ -218,29 +246,51 @@ def create_model(
         use_focal_loss: Whether to use focal loss
         focal_alpha: Focal loss alpha
         focal_gamma: Focal loss gamma
-        strategy: Federated learning strategy ('fedavg' or 'fedprox')
-        mu: FedProx proximal coefficient (only used with strategy='fedprox')
+        strategy: Federated learning strategy
+        mu: FedProx proximal coefficient
 
     Returns:
-        SNPLightningModule instance
+        Lightning module instance
     """
     # Set mu based on strategy
     effective_mu = mu if strategy == 'fedprox' else 0.0
 
-    model = SNPLightningModule(
-        n_snps=n_features,
-        encoding_dim=encoding_dim,
-        num_classes=num_classes,
-        architecture=architecture,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-        use_focal_loss=use_focal_loss,
-        focal_alpha=focal_alpha,
-        focal_gamma=focal_gamma,
-        scheduler_type='cosine',
-        mu=effective_mu,
-    )
-    logger.info(f"Created model: arch={architecture}, n_features={n_features}, classes={num_classes}")
+    if model_type == 'haploblock':
+        # Use HaploblockLightningModule for 2D cluster ID input
+        model = HaploblockLightningModule(
+            n_haploblocks=n_features,
+            vocab_sizes=vocab_sizes,
+            embedding_dim=embedding_dim,
+            transformer_dim=transformer_dim,
+            num_classes=num_classes,
+            architecture=architecture if architecture in ['transformer', 'cnn_transformer'] else 'transformer',
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            use_focal_loss=use_focal_loss,
+            focal_alpha=focal_alpha,
+            focal_gamma=focal_gamma,
+            scheduler_type='cosine',
+            mu=effective_mu,
+        )
+        logger.info(f"Created HaploblockLightningModule: arch={architecture}, n_haploblocks={n_features}")
+        logger.info(f"Vocab sizes: {vocab_sizes[:5]}... (total {len(vocab_sizes)})")
+    else:
+        # Use SNPLightningModule for 3D input
+        model = SNPLightningModule(
+            n_snps=n_features,
+            encoding_dim=encoding_dim,
+            num_classes=num_classes,
+            architecture=architecture,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            use_focal_loss=use_focal_loss,
+            focal_alpha=focal_alpha,
+            focal_gamma=focal_gamma,
+            scheduler_type='cosine',
+            mu=effective_mu,
+        )
+        logger.info(f"Created SNPLightningModule: arch={architecture}, n_snps={n_features}")
+
     logger.info(f"Strategy: {strategy}, mu={effective_mu}")
     return model
 
@@ -290,15 +340,37 @@ def run_federated_client(args):
     sample_batch = next(iter(data_module.train_dataloader()))
     X_sample = sample_batch[0]
     n_features = X_sample.shape[1]
-    actual_encoding_dim = X_sample.shape[2]
 
-    logger.info(f"Data loaded: n_features={n_features}, encoding_dim={actual_encoding_dim}")
+    # Determine if data is 2D (haploblock) or 3D (SNP)
+    if len(X_sample.shape) == 2:
+        # 2D data: (batch, n_haploblocks) - cluster IDs
+        logger.info(f"Detected 2D data (haploblock cluster IDs): shape={X_sample.shape}")
+        actual_encoding_dim = None
+
+        # Compute vocab sizes from all training data
+        all_data = data_module.train_dataset.tensors[0]
+        vocab_sizes = []
+        for i in range(n_features):
+            max_val = int(all_data[:, i].max().item()) + 1
+            vocab_sizes.append(max(max_val + 1, 2))  # +1 for padding, min 2
+        logger.info(f"Computed vocab sizes: {vocab_sizes[:5]}... max={max(vocab_sizes)}")
+    else:
+        # 3D data: (batch, n_snps, encoding_dim)
+        actual_encoding_dim = X_sample.shape[2]
+        vocab_sizes = [1] * n_features  # Not used for SNP model
+        logger.info(f"Detected 3D data (SNP): shape={X_sample.shape}")
+
+    logger.info(f"Data loaded: n_features={n_features}")
     logger.info(f"Train samples: {len(data_module.train_dataset)}, Val samples: {len(data_module.val_dataset)}")
 
     # Step 4: Create model with federated learning strategy
     model = create_model(
+        model_type=args.model_type,
         n_features=n_features,
-        encoding_dim=actual_encoding_dim,
+        vocab_sizes=vocab_sizes,
+        encoding_dim=actual_encoding_dim or args.encoding_dim,
+        embedding_dim=args.embedding_dim,
+        transformer_dim=args.transformer_dim,
         num_classes=args.num_classes,
         architecture=args.architecture,
         learning_rate=args.learning_rate,

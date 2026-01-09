@@ -185,11 +185,30 @@ def parse_args():
 
     # Model configuration
     parser.add_argument(
+        '--model_type',
+        type=str,
+        default='haploblock',
+        choices=['snp', 'haploblock'],
+        help='Model type: snp (3D input) or haploblock (2D cluster IDs)'
+    )
+    parser.add_argument(
         '--architecture',
         type=str,
-        default='cnn_transformer',
-        choices=['cnn', 'cnn_transformer', 'gnn'],
+        default='transformer',
+        choices=['cnn', 'cnn_transformer', 'transformer'],
         help='Model architecture'
+    )
+    parser.add_argument(
+        '--embedding_dim',
+        type=int,
+        default=32,
+        help='Embedding dimension (for haploblock model)'
+    )
+    parser.add_argument(
+        '--transformer_dim',
+        type=int,
+        default=128,
+        help='Transformer hidden dimension'
     )
     parser.add_argument(
         '--num_classes',
@@ -266,6 +285,9 @@ def create_job_with_recipe(
     beta2: float = 0.999,
     momentum: float = 0.9,
     epsilon: float = 1e-8,
+    model_type: str = 'haploblock',
+    embedding_dim: int = 32,
+    transformer_dim: int = 128,
 ):
     """
     Create NVFlare job with specified federated learning strategy.
@@ -383,7 +405,10 @@ def create_job_with_recipe(
     base_args = (
         f"--data_dir {data_dir} "
         f"--feature_type {feature_type} "
+        f"--model_type {model_type} "
         f"--architecture {architecture} "
+        f"--embedding_dim {embedding_dim} "
+        f"--transformer_dim {transformer_dim} "
         f"--num_classes {num_classes} "
         f"--local_epochs {local_epochs} "
         f"--batch_size {batch_size} "
@@ -463,6 +488,9 @@ def run_poc_mode(args):
         beta2=args.beta2,
         momentum=args.momentum,
         epsilon=args.epsilon,
+        model_type=args.model_type,
+        embedding_dim=args.embedding_dim,
+        transformer_dim=args.transformer_dim,
     )
 
     # Verify data exists for each client
@@ -565,6 +593,9 @@ def run_export_mode(args):
         beta2=args.beta2,
         momentum=args.momentum,
         epsilon=args.epsilon,
+        model_type=args.model_type,
+        embedding_dim=args.embedding_dim,
+        transformer_dim=args.transformer_dim,
     )
 
     # Export job
