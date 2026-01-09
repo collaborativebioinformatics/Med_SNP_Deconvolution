@@ -334,19 +334,40 @@ def create_job_with_recipe(
         min_clients=min_clients if min_clients else len(clients),
     )
 
-    # Create controller using strategy registry
-    controller = create_controller(
-        strategy=strategy,
-        num_clients=len(clients),
-        num_rounds=num_rounds,
-        mu=mu,
-        server_optimizer=server_optimizer,
-        server_lr=server_lr,
-        beta1=beta1,
-        beta2=beta2,
-        momentum=momentum,
-        epsilon=epsilon,
-    )
+    # Create controller directly for better NVFlare 2.7.x compatibility
+    # Note: Using FedAvg directly instead of registry for FedAvg/FedProx
+    # SCAFFOLD support requires additional client-side implementation
+    if strategy.lower() in ['fedavg', 'fedprox']:
+        from nvflare.app_common.workflows.fedavg import FedAvg
+        controller = FedAvg(
+            num_clients=len(clients),
+            num_rounds=num_rounds,
+        )
+        logger.info(f"Created FedAvg controller (strategy={strategy})")
+    elif strategy.lower() == 'scaffold':
+        logger.warning("SCAFFOLD requires special client implementation - falling back to FedAvg")
+        from nvflare.app_common.workflows.fedavg import FedAvg
+        controller = FedAvg(
+            num_clients=len(clients),
+            num_rounds=num_rounds,
+        )
+    elif strategy.lower() == 'fedopt':
+        # Use custom FedOpt controller
+        controller = create_controller(
+            strategy=strategy,
+            num_clients=len(clients),
+            num_rounds=num_rounds,
+            mu=mu,
+            server_optimizer=server_optimizer,
+            server_lr=server_lr,
+            beta1=beta1,
+            beta2=beta2,
+            momentum=momentum,
+            epsilon=epsilon,
+        )
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
     job.to_server(controller)
     logger.info(f"Added {strategy_metadata.display_name} controller to server")
 
