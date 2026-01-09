@@ -25,6 +25,16 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+# sklearn metrics for AUROC/AUC
+try:
+    from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, precision_recall_curve
+    from sklearn.preprocessing import label_binarize
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+    logger = logging.getLogger(__name__)
+    logger.warning("sklearn not installed. AUROC/AUC metrics will not be computed.")
+
 # Add project path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -360,15 +370,105 @@ def evaluate_model(
     macro_recall = np.mean(recall_per_class)
     macro_f1 = 2 * macro_precision * macro_recall / (macro_precision + macro_recall) if (macro_precision + macro_recall) > 0 else 0
 
+    # F1 per class
+    f1_per_class = []
+    for p, r in zip(precision_per_class, recall_per_class):
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+        f1_per_class.append(f1)
+
+    # 计算 AUROC 和 AUC-PR (需要 sklearn)
+    auroc_macro = None
+    auroc_weighted = None
+    auroc_per_class = {}
+    auc_pr_macro = None
+    auc_pr_weighted = None
+    auc_pr_per_class = {}
+
+    if HAS_SKLEARN and n_classes >= 2:
+        try:
+            # 二分类
+            if n_classes == 2:
+                # AUROC - 使用正类的概率
+                auroc_macro = roc_auc_score(all_labels, all_probs[:, 1])
+                auroc_weighted = auroc_macro
+                auroc_per_class = {0: auroc_macro, 1: auroc_macro}
+
+                # AUC-PR (Average Precision)
+                auc_pr_macro = average_precision_score(all_labels, all_probs[:, 1])
+                auc_pr_weighted = auc_pr_macro
+                auc_pr_per_class = {0: auc_pr_macro, 1: auc_pr_macro}
+
+            # 多分类
+            else:
+                # One-vs-Rest binarization
+                y_bin = label_binarize(all_labels, classes=list(range(n_classes)))
+
+                # AUROC macro/weighted
+                try:
+                    auroc_macro = roc_auc_score(y_bin, all_probs, average='macro', multi_class='ovr')
+                    auroc_weighted = roc_auc_score(y_bin, all_probs, average='weighted', multi_class='ovr')
+                except ValueError as e:
+                    logger.warning(f"AUROC calculation failed: {e}")
+
+                # AUROC per class
+                for i in range(n_classes):
+                    try:
+                        auroc_per_class[i] = roc_auc_score(y_bin[:, i], all_probs[:, i])
+                    except ValueError:
+                        auroc_per_class[i] = None
+
+                # AUC-PR (Average Precision) macro/weighted
+                try:
+                    auc_pr_macro = average_precision_score(y_bin, all_probs, average='macro')
+                    auc_pr_weighted = average_precision_score(y_bin, all_probs, average='weighted')
+                except ValueError as e:
+                    logger.warning(f"AUC-PR calculation failed: {e}")
+
+                # AUC-PR per class
+                for i in range(n_classes):
+                    try:
+                        auc_pr_per_class[i] = average_precision_score(y_bin[:, i], all_probs[:, i])
+                    except ValueError:
+                        auc_pr_per_class[i] = None
+
+        except Exception as e:
+            logger.warning(f"Error computing AUROC/AUC-PR: {e}")
+
+    # 计算 specificity (特异性) per class
+    specificity_per_class = []
+    for i in range(n_classes):
+        tn = confusion_matrix.sum() - confusion_matrix[i, :].sum() - confusion_matrix[:, i].sum() + confusion_matrix[i, i]
+        fp = confusion_matrix[:, i].sum() - confusion_matrix[i, i]
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        specificity_per_class.append(specificity)
+
+    macro_specificity = np.mean(specificity_per_class)
+
+    # 计算 balanced accuracy
+    balanced_accuracy = np.mean(recall_per_class)  # 等价于每类 recall 的平均
+
     return {
         'accuracy': float(accuracy),
+        'balanced_accuracy': float(balanced_accuracy),
         'loss': float(avg_loss),
         'macro_f1': float(macro_f1),
         'macro_precision': float(macro_precision),
         'macro_recall': float(macro_recall),
+        'macro_specificity': float(macro_specificity),
+        'auroc_macro': float(auroc_macro) if auroc_macro is not None else None,
+        'auroc_weighted': float(auroc_weighted) if auroc_weighted is not None else None,
+        'auc_pr_macro': float(auc_pr_macro) if auc_pr_macro is not None else None,
+        'auc_pr_weighted': float(auc_pr_weighted) if auc_pr_weighted is not None else None,
         'per_class_accuracy': per_class_acc,
+        'per_class_precision': {int(i): float(p) for i, p in enumerate(precision_per_class)},
+        'per_class_recall': {int(i): float(r) for i, r in enumerate(recall_per_class)},
+        'per_class_f1': {int(i): float(f) for i, f in enumerate(f1_per_class)},
+        'per_class_specificity': {int(i): float(s) for i, s in enumerate(specificity_per_class)},
+        'per_class_auroc': {int(k): float(v) if v is not None else None for k, v in auroc_per_class.items()},
+        'per_class_auc_pr': {int(k): float(v) if v is not None else None for k, v in auc_pr_per_class.items()},
         'confusion_matrix': confusion_matrix.tolist(),
         'n_samples': len(all_labels),
+        'n_classes': n_classes,
     }
 
 

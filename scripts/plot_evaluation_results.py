@@ -451,6 +451,343 @@ def plot_summary_table(
     logger.info(f"Saved: {output_path}")
 
 
+def plot_multi_metric_comparison(
+    results: Dict[str, Any],
+    output_dir: Path,
+    output_format: str = 'png'
+):
+    """
+    绘制多指标对比图 (Accuracy, AUROC, AUC-PR, F1)
+    """
+    if not HAS_MATPLOTLIB:
+        return
+
+    # 定义要对比的指标
+    metrics = ['accuracy', 'auroc_macro', 'auc_pr_macro', 'macro_f1']
+    metric_labels = ['Accuracy', 'AUROC', 'AUC-PR', 'Macro F1']
+
+    # 组织数据: {exp_name: {metric: value}}
+    data = {}
+    for exp_name, exp_results in results.items():
+        if exp_results.get('aggregated_result'):
+            agg = exp_results['aggregated_result']
+            data[exp_name] = {m: agg.get(m) for m in metrics}
+
+    if not data:
+        return
+
+    # 创建图表
+    exp_names = list(data.keys())
+    x = np.arange(len(exp_names))
+    width = 0.8 / len(metrics)
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+
+    colors = ['#3498db', '#e74c3c', '#2ecc71', '#9b59b6']
+
+    for i, (metric, label) in enumerate(zip(metrics, metric_labels)):
+        values = [data[exp].get(metric) or 0 for exp in exp_names]
+        offset = (i - len(metrics) / 2) * width + width / 2
+        bars = ax.bar(x + offset, values, width, label=label, color=colors[i], alpha=0.8)
+
+        # 添加数值标签
+        for bar, val in zip(bars, values):
+            if val and val > 0:
+                ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height(),
+                        f'{val:.3f}', ha='center', va='bottom', fontsize=7, rotation=45)
+
+    ax.set_xlabel('Experiment')
+    ax.set_ylabel('Score')
+    ax.set_title('Multi-Metric Comparison Across Experiments')
+    ax.set_xticks(x)
+    ax.set_xticklabels([n.replace('_', '\n') for n in exp_names], fontsize=8)
+    ax.legend(loc='lower right')
+    ax.set_ylim([0, 1.05])
+    ax.grid(True, axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    output_path = output_dir / f'multi_metric_comparison.{output_format}'
+    plt.savefig(output_path, dpi=plt.rcParams['figure.dpi'], bbox_inches='tight')
+    plt.close()
+
+    logger.info(f"Saved: {output_path}")
+
+
+def plot_per_class_metrics(
+    results: Dict[str, Any],
+    output_dir: Path,
+    output_format: str = 'png'
+):
+    """
+    绘制每类指标雷达图
+    """
+    if not HAS_MATPLOTLIB:
+        return
+
+    for exp_name, exp_results in results.items():
+        agg = exp_results.get('aggregated_result')
+        if not agg:
+            continue
+
+        n_classes = agg.get('n_classes', 0)
+        if n_classes == 0:
+            continue
+
+        # 收集每类指标
+        metrics = ['precision', 'recall', 'f1', 'specificity']
+        metric_data = {}
+        for metric in metrics:
+            per_class = agg.get(f'per_class_{metric}', {})
+            metric_data[metric] = [per_class.get(str(i)) or per_class.get(i, 0) for i in range(n_classes)]
+
+        # 添加 AUROC 和 AUC-PR (如果有)
+        per_class_auroc = agg.get('per_class_auroc', {})
+        per_class_auc_pr = agg.get('per_class_auc_pr', {})
+        if per_class_auroc:
+            metric_data['auroc'] = [per_class_auroc.get(str(i)) or per_class_auroc.get(i) or 0 for i in range(n_classes)]
+            metrics.append('auroc')
+        if per_class_auc_pr:
+            metric_data['auc_pr'] = [per_class_auc_pr.get(str(i)) or per_class_auc_pr.get(i) or 0 for i in range(n_classes)]
+            metrics.append('auc_pr')
+
+        # 创建子图: 每类一个雷达图
+        fig, axes = plt.subplots(1, n_classes, figsize=(5 * n_classes, 5), subplot_kw=dict(polar=True))
+        if n_classes == 1:
+            axes = [axes]
+
+        angles = np.linspace(0, 2 * np.pi, len(metrics), endpoint=False).tolist()
+        angles += angles[:1]  # 闭合
+
+        for class_idx, ax in enumerate(axes):
+            values = [metric_data[m][class_idx] for m in metrics]
+            values += values[:1]  # 闭合
+
+            ax.plot(angles, values, 'o-', linewidth=2, color='#3498db')
+            ax.fill(angles, values, alpha=0.25, color='#3498db')
+            ax.set_xticks(angles[:-1])
+            ax.set_xticklabels([m.replace('_', '\n').title() for m in metrics], size=8)
+            ax.set_ylim([0, 1])
+            ax.set_title(f'Class {class_idx}', size=12, y=1.1)
+
+        fig.suptitle(f'Per-Class Metrics: {exp_name}', size=14, y=1.02)
+        plt.tight_layout()
+        output_path = output_dir / f'per_class_metrics_{exp_name}.{output_format}'
+        plt.savefig(output_path, dpi=plt.rcParams['figure.dpi'], bbox_inches='tight')
+        plt.close()
+
+        logger.info(f"Saved: {output_path}")
+
+
+def plot_metrics_heatmap(
+    results: Dict[str, Any],
+    output_dir: Path,
+    output_format: str = 'png'
+):
+    """
+    绘制全指标热力图
+    """
+    if not HAS_MATPLOTLIB:
+        return
+
+    # 收集所有实验的指标
+    metrics = ['accuracy', 'balanced_accuracy', 'macro_f1', 'macro_precision',
+               'macro_recall', 'macro_specificity', 'auroc_macro', 'auc_pr_macro']
+    metric_labels = ['Accuracy', 'Bal. Acc', 'F1', 'Precision',
+                     'Recall', 'Specificity', 'AUROC', 'AUC-PR']
+
+    exp_names = []
+    data_matrix = []
+
+    for exp_name, exp_results in results.items():
+        agg = exp_results.get('aggregated_result')
+        if not agg:
+            continue
+
+        exp_names.append(exp_name)
+        row = [agg.get(m) or 0 for m in metrics]
+        data_matrix.append(row)
+
+    if not data_matrix:
+        return
+
+    data_matrix = np.array(data_matrix)
+
+    fig, ax = plt.subplots(figsize=(12, max(6, len(exp_names) * 0.6)))
+
+    if HAS_SEABORN:
+        sns.heatmap(data_matrix, annot=True, fmt='.3f', cmap='RdYlGn',
+                    xticklabels=metric_labels,
+                    yticklabels=[n.replace('_', '\n') for n in exp_names],
+                    ax=ax, vmin=0.3, vmax=1.0, cbar_kws={'label': 'Score'})
+    else:
+        im = ax.imshow(data_matrix, cmap='RdYlGn', vmin=0.3, vmax=1.0, aspect='auto')
+        plt.colorbar(im, ax=ax, label='Score')
+
+        for i in range(len(exp_names)):
+            for j in range(len(metrics)):
+                val = data_matrix[i, j]
+                color = 'white' if val < 0.5 else 'black'
+                ax.text(j, i, f'{val:.3f}', ha='center', va='center', color=color, fontsize=8)
+
+        ax.set_xticks(range(len(metrics)))
+        ax.set_xticklabels(metric_labels, rotation=45, ha='right')
+        ax.set_yticks(range(len(exp_names)))
+        ax.set_yticklabels([n.replace('_', '\n') for n in exp_names])
+
+    ax.set_title('All Metrics Heatmap', fontsize=14)
+
+    plt.tight_layout()
+    output_path = output_dir / f'all_metrics_heatmap.{output_format}'
+    plt.savefig(output_path, dpi=plt.rcParams['figure.dpi'], bbox_inches='tight')
+    plt.close()
+
+    logger.info(f"Saved: {output_path}")
+
+
+def plot_auroc_comparison(
+    results: Dict[str, Any],
+    output_dir: Path,
+    output_format: str = 'png'
+):
+    """
+    绘制 AUROC 和 AUC-PR 对比图
+    """
+    if not HAS_MATPLOTLIB:
+        return
+
+    # 组织数据
+    data = {}
+
+    for exp_name, exp_results in results.items():
+        split_type, strategy = parse_experiment_name(exp_name)
+
+        if split_type not in data:
+            data[split_type] = {}
+
+        if exp_results.get('aggregated_result'):
+            agg = exp_results['aggregated_result']
+            data[split_type][strategy] = {
+                'auroc': agg.get('auroc_macro'),
+                'auc_pr': agg.get('auc_pr_macro'),
+            }
+
+    if not data:
+        return
+
+    split_types = sorted(data.keys())
+    strategies = sorted(set(s for splits in data.values() for s in splits.keys()))
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    for ax_idx, (metric, title) in enumerate([('auroc', 'AUROC (Macro)'), ('auc_pr', 'AUC-PR (Macro)')]):
+        ax = axes[ax_idx]
+        x = np.arange(len(split_types))
+        width = 0.8 / len(strategies)
+
+        for i, strategy in enumerate(strategies):
+            values = []
+            for split in split_types:
+                val = data[split].get(strategy, {}).get(metric)
+                values.append(val if val is not None else 0)
+
+            offset = (i - len(strategies) / 2) * width + width / 2
+            color = STRATEGY_COLORS.get(strategy, None)
+            bars = ax.bar(x + offset, values, width, label=strategy, color=color, alpha=0.8)
+
+            for bar, val in zip(bars, values):
+                if val > 0:
+                    ax.text(bar.get_x() + bar.get_width() / 2., bar.get_height(),
+                            f'{val:.3f}', ha='center', va='bottom', fontsize=8)
+
+        ax.set_xlabel('Data Split')
+        ax.set_ylabel(title)
+        ax.set_title(f'{title} by Strategy')
+        ax.set_xticks(x)
+        ax.set_xticklabels([s.replace('_', '\n') for s in split_types])
+        ax.legend(loc='lower right')
+        ax.set_ylim([0, 1.05])
+        ax.grid(True, axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    output_path = output_dir / f'auroc_auc_pr_comparison.{output_format}'
+    plt.savefig(output_path, dpi=plt.rcParams['figure.dpi'], bbox_inches='tight')
+    plt.close()
+
+    logger.info(f"Saved: {output_path}")
+
+
+def plot_enhanced_summary_table(
+    results: Dict[str, Any],
+    output_dir: Path,
+    output_format: str = 'png'
+):
+    """
+    生成增强版汇总表格 (包含 AUROC, AUC-PR 等)
+    """
+    if not HAS_MATPLOTLIB:
+        return
+
+    rows = []
+    for exp_name, exp_results in results.items():
+        split_type, strategy = parse_experiment_name(exp_name)
+
+        if exp_results.get('aggregated_result'):
+            agg = exp_results['aggregated_result']
+            rows.append({
+                'Strategy': strategy,
+                'Split': split_type,
+                'Acc': f"{agg.get('accuracy', 0):.4f}",
+                'Bal.Acc': f"{agg.get('balanced_accuracy', 0):.4f}",
+                'F1': f"{agg.get('macro_f1', 0):.4f}",
+                'Prec': f"{agg.get('macro_precision', 0):.4f}",
+                'Recall': f"{agg.get('macro_recall', 0):.4f}",
+                'Spec': f"{agg.get('macro_specificity', 0):.4f}",
+                'AUROC': f"{agg.get('auroc_macro', 0) or 0:.4f}",
+                'AUC-PR': f"{agg.get('auc_pr_macro', 0) or 0:.4f}",
+            })
+
+    if not rows:
+        return
+
+    rows = sorted(rows, key=lambda x: (x['Split'], x['Strategy']))
+
+    fig, ax = plt.subplots(figsize=(16, len(rows) * 0.5 + 2))
+    ax.axis('off')
+
+    columns = ['Strategy', 'Split', 'Acc', 'Bal.Acc', 'F1', 'Prec', 'Recall', 'Spec', 'AUROC', 'AUC-PR']
+    cell_text = [[row[col] for col in columns] for row in rows]
+
+    table = ax.table(
+        cellText=cell_text,
+        colLabels=columns,
+        loc='center',
+        cellLoc='center',
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.2, 1.5)
+
+    # 表头样式
+    for j, col in enumerate(columns):
+        table[(0, j)].set_facecolor('#4a90d9')
+        table[(0, j)].set_text_props(color='white', fontweight='bold')
+
+    # 交替行颜色
+    for i in range(1, len(rows) + 1):
+        for j in range(len(columns)):
+            if i % 2 == 0:
+                table[(i, j)].set_facecolor('#f0f0f0')
+
+    ax.set_title('Comprehensive Evaluation Results', fontsize=14, fontweight='bold', pad=20)
+
+    plt.tight_layout()
+    output_path = output_dir / f'enhanced_summary_table.{output_format}'
+    plt.savefig(output_path, dpi=plt.rcParams['figure.dpi'], bbox_inches='tight')
+    plt.close()
+
+    logger.info(f"Saved: {output_path}")
+
+
 def generate_all_plots(
     results: Dict[str, Any],
     output_dir: Path,
@@ -510,6 +847,36 @@ def generate_all_plots(
         plot_summary_table(results, output_dir, output_format)
     except Exception as e:
         logger.error(f"Error generating summary table: {e}")
+
+    # 7. 多指标对比图
+    try:
+        plot_multi_metric_comparison(results, output_dir, output_format)
+    except Exception as e:
+        logger.error(f"Error generating multi-metric comparison: {e}")
+
+    # 8. AUROC/AUC-PR 对比图
+    try:
+        plot_auroc_comparison(results, output_dir, output_format)
+    except Exception as e:
+        logger.error(f"Error generating AUROC comparison: {e}")
+
+    # 9. 全指标热力图
+    try:
+        plot_metrics_heatmap(results, output_dir, output_format)
+    except Exception as e:
+        logger.error(f"Error generating metrics heatmap: {e}")
+
+    # 10. 每类指标雷达图
+    try:
+        plot_per_class_metrics(results, output_dir, output_format)
+    except Exception as e:
+        logger.error(f"Error generating per-class metrics: {e}")
+
+    # 11. 增强版汇总表格
+    try:
+        plot_enhanced_summary_table(results, output_dir, output_format)
+    except Exception as e:
+        logger.error(f"Error generating enhanced summary table: {e}")
 
     logger.info(f"All plots saved to: {output_dir}")
 
