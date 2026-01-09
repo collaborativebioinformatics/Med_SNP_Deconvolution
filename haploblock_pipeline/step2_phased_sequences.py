@@ -10,6 +10,7 @@ from functools import partial
 from typing import Tuple, Dict, Optional
 
 import numpy as np
+from tqdm import tqdm
 
 import data_parser
 
@@ -200,18 +201,24 @@ def run_phased_sequences(boundaries_file: pathlib.Path,
     (tmp_dir / "consensus_fasta").mkdir(parents=True, exist_ok=True)
 
     # Prepare work list: all (sample, haploblock)
+    logger.info("Extracting regions from VCF/FASTA...")
     work = []
-    for start, end in haploblocks:
+    for start, end in tqdm(haploblocks, desc="Extracting regions", unit="block"):
         region_vcf = data_parser.extract_region_from_vcf(vcf, chrom, chr_map, start, end, out_dir, threads=cpu_count())
         region_fasta = data_parser.extract_region_from_fasta(ref, chrom, start, end, out_dir)
         work.extend([(s, region_vcf, region_fasta, ref, out_dir) for s in samples])
 
     # Multiprocessing
+    logger.info("Processing %d sample-region pairs...", len(work))
     if workers == 1:
-        results = [_process_sample_for_region(w, gpu=gpu, gpu_id=gpu_id, tmp_dir=tmp_dir, threads=bcf_threads) for w in work]
+        results = [_process_sample_for_region(w, gpu=gpu, gpu_id=gpu_id, tmp_dir=tmp_dir, threads=bcf_threads)
+                   for w in tqdm(work, desc="Processing samples", unit="sample")]
     else:
         with Pool(workers) as pool:
-            results = pool.map(partial(_process_sample_for_region, gpu=gpu, gpu_id=gpu_id, tmp_dir=tmp_dir, threads=bcf_threads), work)
+            results = list(tqdm(
+                pool.imap(partial(_process_sample_for_region, gpu=gpu, gpu_id=gpu_id, tmp_dir=tmp_dir, threads=bcf_threads), work),
+                total=len(work), desc="Processing samples", unit="sample"
+            ))
 
     # Aggregate variant counts per haploblock
     haploblock2count = {}
