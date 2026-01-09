@@ -6,6 +6,8 @@ import argparse
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from tqdm import tqdm
+
 import data_parser
 
 logger = logging.getLogger(__name__)
@@ -45,7 +47,7 @@ def calculate_mmseq_params(variant_counts_file: pathlib.Path):
 # Run clustering per FASTA
 # ----------------------------------------------------------------------
 def compute_clusters(input_fasta: str, out: str, min_seq_id: float, cov_fraction: float, cov_mode: int,
-                     chrom: str, start: str, end: str):
+                     chrom: str, start: str, end: str, threads_per_task: int = 1):
 
     # Resolve EVERYTHING to absolute paths
     input_fasta = str(pathlib.Path(input_fasta).resolve())
@@ -65,11 +67,12 @@ def compute_clusters(input_fasta: str, out: str, min_seq_id: float, cov_fraction
         "--min-seq-id", str(min_seq_id),
         "-c", str(cov_fraction),
         "--cov-mode", str(cov_mode),
+        "--threads", str(threads_per_task),
         "--remove-tmp-files", "1"
     ]
 
     logger.debug("Running: %s", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, capture_output=True)
 
 
 # ----------------------------------------------------------------------
@@ -92,10 +95,14 @@ def run_clusters(boundaries_file: pathlib.Path,
     logger.info("Found %d haploblocks", len(haploblock_boundaries))
     (haploblock2min_id, haploblock2cov_fraction) = calculate_mmseq_params(variant_counts_file)
 
-    logger.info("Computing clusters with MMseqs2 using %s threads...", threads or "auto")
-    max_workers = threads or max(1, os.cpu_count() - 1)
-    futures = []
+    # Parallel strategy: limit concurrent tasks, each gets multiple threads
+    cpu = os.cpu_count() or 8
+    max_workers = min(8, cpu)  # at most 8 parallel MMseqs2 tasks
+    threads_per_task = max(1, cpu // max_workers)
+    logger.info("Computing clusters: %d parallel tasks × %d threads each (total cores: %d)",
+                max_workers, threads_per_task, cpu)
 
+    futures = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for start, end in haploblock_boundaries:
             input_fasta = merged_consensus_dir / f"chr{chrom}_region_{start}-{end}.fa"
@@ -107,11 +114,13 @@ def run_clusters(boundaries_file: pathlib.Path,
                     haploblock2min_id[(start, end)],
                     haploblock2cov_fraction[(start, end)],
                     cov_mode,
-                    chrom, start, end
+                    chrom, start, end,
+                    threads_per_task
                 )
             )
 
-        for fut in as_completed(futures):
+        # Progress bar
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Clustering", unit="block"):
             fut.result()  # propagate exceptions if any
 
     logger.info("All clusters computed successfully.")
