@@ -29,7 +29,8 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dl_models.snp_interpretable_models import InterpretableSNPModel
-from snp_deconvolution.attention_dl.lightning_trainer import SNPLightningModule
+from dl_models.haploblock_embedding_model import HaploblockTransformer, HaploblockCNNTransformer
+from snp_deconvolution.attention_dl.lightning_trainer import SNPLightningModule, HaploblockLightningModule
 
 # Configure logging
 logging.basicConfig(
@@ -89,28 +90,59 @@ def load_model_from_checkpoint(ckpt_path: Path) -> Tuple[nn.Module, Dict[str, An
     """
     从 checkpoint 加载模型 (使用 Lightning 的 load_from_checkpoint)
 
+    支持两种模型:
+    1. HaploblockLightningModule - 用于 cluster ID 输入 (2D)
+    2. SNPLightningModule - 用于 SNP 数据输入 (3D)
+
     Returns:
-        model: 加载的模型 (InterpretableSNPModel)
+        model: 加载的模型
         params: 模型参数
     """
-    # 直接使用 Lightning 加载，自动恢复超参数
-    lightning_module = SNPLightningModule.load_from_checkpoint(ckpt_path, map_location='cpu')
+    # 首先尝试加载 HaploblockLightningModule (新模型)
+    try:
+        lightning_module = HaploblockLightningModule.load_from_checkpoint(ckpt_path, map_location='cpu')
+        model = lightning_module.model
+        hparams = lightning_module.hparams
 
-    # 获取内部的 InterpretableSNPModel
-    model = lightning_module.model
+        params = {
+            'model_type': 'haploblock',
+            'n_haploblocks': hparams.get('n_haploblocks'),
+            'vocab_sizes': hparams.get('vocab_sizes'),
+            'embedding_dim': hparams.get('embedding_dim', 32),
+            'transformer_dim': hparams.get('transformer_dim', 128),
+            'num_classes': hparams.get('num_classes', 3),
+            'architecture': hparams.get('architecture', 'transformer'),
+            'num_layers': hparams.get('num_layers', 4),
+            'num_heads': hparams.get('num_heads', 8),
+        }
 
-    # 从 hparams 获取参数
-    hparams = lightning_module.hparams
-    params = {
-        'n_snps': hparams.get('n_snps'),
-        'encoding_dim': hparams.get('encoding_dim', 8),
-        'num_classes': hparams.get('num_classes', 2),
-        'architecture': hparams.get('architecture', 'cnn_transformer'),
-    }
+        logger.info(f"  HaploblockLightningModule: n_haploblocks={params['n_haploblocks']}, "
+                    f"embedding_dim={params['embedding_dim']}, num_classes={params['num_classes']}")
+        return model, params
 
-    logger.info(f"  模型参数: n_snps={params['n_snps']}, encoding_dim={params['encoding_dim']}, num_classes={params['num_classes']}")
+    except Exception as e:
+        logger.debug(f"  无法作为 HaploblockLightningModule 加载: {e}")
 
-    return model, params
+    # 回退到 SNPLightningModule (旧模型)
+    try:
+        lightning_module = SNPLightningModule.load_from_checkpoint(ckpt_path, map_location='cpu')
+        model = lightning_module.model
+        hparams = lightning_module.hparams
+
+        params = {
+            'model_type': 'snp',
+            'n_snps': hparams.get('n_snps'),
+            'encoding_dim': hparams.get('encoding_dim', 8),
+            'num_classes': hparams.get('num_classes', 2),
+            'architecture': hparams.get('architecture', 'cnn_transformer'),
+        }
+
+        logger.info(f"  SNPLightningModule: n_snps={params['n_snps']}, "
+                    f"encoding_dim={params['encoding_dim']}, num_classes={params['num_classes']}")
+        return model, params
+
+    except Exception as e:
+        raise RuntimeError(f"无法加载 checkpoint {ckpt_path}: {e}")
 
 
 def load_test_data(data_dir: Path, feature_type: str = "cluster") -> Tuple[torch.Tensor, torch.Tensor]:
@@ -189,21 +221,53 @@ def load_test_data(data_dir: Path, feature_type: str = "cluster") -> Tuple[torch
 def aggregate_models(
     models: List[nn.Module],
     weights: Optional[List[float]] = None,
-    num_classes: int = 2
+    model_params: Optional[Dict[str, Any]] = None,
+    num_classes: int = 3
 ) -> nn.Module:
     """
     聚合多个模型的权重 (FedAvg 风格)
+
+    支持两种模型:
+    1. HaploblockTransformer/HaploblockCNNTransformer - 用于 cluster ID 输入
+    2. InterpretableSNPModel - 用于 SNP 数据输入
     """
     if weights is None:
         weights = [1.0 / len(models)] * len(models)
 
-    # 使用第一个模型作为基础
-    aggregated_model = models[0].__class__(
-        n_snps=models[0].n_snps,
-        num_classes=num_classes,
-        encoding_dim=models[0].encoding_dim,
-        architecture=models[0].architecture,
-    )
+    model_type = model_params.get('model_type', 'snp') if model_params else 'snp'
+
+    # 根据模型类型创建聚合模型
+    if model_type == 'haploblock':
+        # HaploblockTransformer or HaploblockCNNTransformer
+        architecture = model_params.get('architecture', 'transformer')
+        if architecture == 'cnn_transformer':
+            aggregated_model = HaploblockCNNTransformer(
+                n_haploblocks=model_params['n_haploblocks'],
+                vocab_sizes=model_params['vocab_sizes'],
+                embedding_dim=model_params.get('embedding_dim', 32),
+                transformer_dim=model_params.get('transformer_dim', 128),
+                num_layers=model_params.get('num_layers', 4),
+                num_heads=model_params.get('num_heads', 8),
+                num_classes=num_classes,
+            )
+        else:
+            aggregated_model = HaploblockTransformer(
+                n_haploblocks=model_params['n_haploblocks'],
+                vocab_sizes=model_params['vocab_sizes'],
+                embedding_dim=model_params.get('embedding_dim', 32),
+                transformer_dim=model_params.get('transformer_dim', 128),
+                num_layers=model_params.get('num_layers', 4),
+                num_heads=model_params.get('num_heads', 8),
+                num_classes=num_classes,
+            )
+    else:
+        # InterpretableSNPModel
+        aggregated_model = InterpretableSNPModel(
+            n_snps=model_params.get('n_snps', models[0].n_snps),
+            num_classes=num_classes,
+            encoding_dim=model_params.get('encoding_dim', 8),
+            architecture=model_params.get('architecture', 'cnn_transformer'),
+        )
 
     # 聚合权重
     aggregated_state_dict = {}
@@ -362,22 +426,33 @@ def evaluate_experiment(
             # 保存模型参数 (从第一个成功加载的模型)
             if model_params is None:
                 model_params = params
+                model_type = params.get('model_type', 'snp')
+
                 # 准备测试数据以匹配模型的期望输入
-                expected_encoding_dim = params['encoding_dim']
-                if len(X_test.shape) == 2:
-                    # 2D 数据扩展到 3D
-                    if expected_encoding_dim == 3:
-                        # 假设是 SNP 数据 (0, 1, 2)，使用 one-hot 编码
-                        X_test_int = X_test.long().clamp(0, 2)
-                        X_test = torch.nn.functional.one_hot(X_test_int, num_classes=3).float()
-                        logger.info(f"使用 one-hot 编码扩展测试数据: {X_test.shape}")
-                    else:
-                        # 其他 encoding_dim，使用简单的特征归一化后扩展
-                        X_test = X_test.unsqueeze(-1).repeat(1, 1, expected_encoding_dim)
-                        # 对每个 encoding 维度添加一些变化以提供信息
-                        for i in range(expected_encoding_dim):
-                            X_test[:, :, i] = X_test[:, :, i] * (1 + 0.1 * i)
-                        logger.info(f"扩展测试数据到 3D: {X_test.shape} (encoding_dim={expected_encoding_dim})")
+                if model_type == 'haploblock':
+                    # Haploblock 模型需要 2D long 类型输入 (batch, n_haploblocks)
+                    if len(X_test.shape) == 3:
+                        # 3D 数据压缩到 2D (取第一个通道或求和)
+                        X_test = X_test[:, :, 0] if X_test.shape[2] > 0 else X_test.squeeze(-1)
+                    X_test = X_test.long()
+                    logger.info(f"Haploblock 模型: 测试数据 shape={X_test.shape}, dtype={X_test.dtype}")
+                else:
+                    # SNP 模型需要 3D float 类型输入 (batch, n_snps, encoding_dim)
+                    expected_encoding_dim = params.get('encoding_dim', 8)
+                    if len(X_test.shape) == 2:
+                        # 2D 数据扩展到 3D
+                        if expected_encoding_dim == 3:
+                            # 假设是 SNP 数据 (0, 1, 2)，使用 one-hot 编码
+                            X_test_int = X_test.long().clamp(0, 2)
+                            X_test = torch.nn.functional.one_hot(X_test_int, num_classes=3).float()
+                            logger.info(f"使用 one-hot 编码扩展测试数据: {X_test.shape}")
+                        else:
+                            # 其他 encoding_dim，使用简单的特征归一化后扩展
+                            X_test = X_test.unsqueeze(-1).repeat(1, 1, expected_encoding_dim)
+                            # 对每个 encoding 维度添加一些变化以提供信息
+                            for i in range(expected_encoding_dim):
+                                X_test[:, :, i] = X_test[:, :, i] * (1 + 0.1 * i)
+                            logger.info(f"扩展测试数据到 3D: {X_test.shape} (encoding_dim={expected_encoding_dim})")
 
             models.append(model)
 
@@ -417,7 +492,7 @@ def evaluate_experiment(
         weights = [c / total_samples for c in site_sample_counts]
 
         actual_num_classes = model_params.get('num_classes', data_num_classes) if model_params else data_num_classes
-        aggregated_model = aggregate_models(models, weights, actual_num_classes)
+        aggregated_model = aggregate_models(models, weights, model_params=model_params, num_classes=actual_num_classes)
         aggregated_result = evaluate_model(aggregated_model, X_test, y_test)
         results['aggregated_result'] = aggregated_result
 
